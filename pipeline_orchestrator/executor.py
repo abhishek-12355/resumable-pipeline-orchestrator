@@ -100,9 +100,11 @@ class SequentialExecutor(BaseExecutor):
             try:
                 result = self.execute_module(module_name, module, context)
                 results[module_name] = result
-                results_manager.save_result(module_name, result)
+                results_manager.save_result(module_name, result, is_error=False)
             except Exception as e:
                 results[module_name] = e
+                # Checkpoint failed module
+                results_manager.save_result(module_name, e, is_error=True)
         
         return results
 
@@ -232,6 +234,8 @@ class ParallelExecutor(BaseExecutor):
                     
                     if isinstance(result, Exception):
                         results[module_name] = result
+                        # Checkpoint failed module
+                        results_manager.save_result(module_name, result, is_error=True)
                         if self.failure_policy == "fail_fast":
                             # Cancel remaining futures
                             for f in futures:
@@ -240,14 +244,16 @@ class ParallelExecutor(BaseExecutor):
                             break
                     else:
                         results[module_name] = result
-                        results_manager.save_result(module_name, result)
-                except Exception as e:
-                    results[module_name] = e
-                    if self.failure_policy == "fail_fast":
-                        for f in futures:
-                            if not f.done():
-                                f.cancel()
-                        break
+                        results_manager.save_result(module_name, result, is_error=False)
+                    except Exception as e:
+                        results[module_name] = e
+                        # Checkpoint failed module
+                        results_manager.save_result(module_name, e, is_error=True)
+                        if self.failure_policy == "fail_fast":
+                            for f in futures:
+                                if not f.done():
+                                    f.cancel()
+                            break
         
         return results
     
@@ -306,6 +312,8 @@ class ParallelExecutor(BaseExecutor):
                         
                         if isinstance(result, Exception):
                             results[module_name] = result
+                            # Checkpoint failed module
+                            results_manager.save_result(module_name, result, is_error=True)
                             if self.failure_policy == "fail_fast":
                                 # Cancel remaining futures
                                 for f in futures:
@@ -314,9 +322,11 @@ class ParallelExecutor(BaseExecutor):
                                 break
                         else:
                             results[module_name] = result
-                            results_manager.save_result(module_name, result)
+                            results_manager.save_result(module_name, result, is_error=False)
                     except Exception as e:
                         results[module_name] = e
+                        # Checkpoint failed module
+                        results_manager.save_result(module_name, e, is_error=True)
                         if self.failure_policy == "fail_fast":
                             for f in futures:
                                 if not f.done():
@@ -364,33 +374,98 @@ class ParallelExecutor(BaseExecutor):
         results_manager: ResultsManager
     ) -> List[Any]:
         """
-        Execute nested tasks.
-        
-        This is a placeholder - full implementation would:
-        1. Validate resources for each task
-        2. Execute tasks in parallel (threads/processes)
-        3. Collect results/errors
-        4. Return results in same order as tasks
+        Execute nested tasks in parallel.
         
         Args:
-            tasks: List of tasks to execute
+            tasks: List of tasks to execute (callables)
             results_manager: Results manager
             
         Returns:
-            List of results/errors
+            List of results/errors in same order as tasks
         """
-        # Simplified implementation - tasks are just callables
-        results = []
+        if not tasks:
+            return []
         
-        for task in tasks:
-            try:
-                if callable(task):
-                    result = task()
-                    results.append(result)
-                else:
-                    results.append(NestedExecutionError(f"Task is not callable: {task}"))
-            except Exception as e:
-                results.append(e)
+        # Validate all tasks are callable
+        for i, task in enumerate(tasks):
+            if not callable(task):
+                return [NestedExecutionError(f"Task {i} is not callable: {task}")] * len(tasks)
+        
+        # Execute tasks in parallel based on worker type
+        if self.worker_type == "thread":
+            return self._execute_nested_tasks_threads(tasks)
+        else:
+            return self._execute_nested_tasks_processes(tasks)
+    
+    def _execute_nested_tasks_threads(self, tasks: List[Any]) -> List[Any]:
+        """
+        Execute nested tasks using threads.
+        
+        Args:
+            tasks: List of callable tasks
+            
+        Returns:
+            List of results/errors in same order as tasks
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        results = [None] * len(tasks)
+        
+        # Execute tasks in parallel using threads
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            # Submit all tasks
+            future_to_index = {
+                executor.submit(task): i
+                for i, task in enumerate(tasks)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    result = future.result()
+                    results[index] = result
+                except Exception as e:
+                    results[index] = e
         
         return results
+    
+    def _execute_nested_tasks_processes(self, tasks: List[Any]) -> List[Any]:
+        """
+        Execute nested tasks using processes.
+        
+        Args:
+            tasks: List of callable tasks
+            
+        Returns:
+            List of results/errors in same order as tasks
+        """
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        
+        # Note: Tasks must be picklable for multiprocessing
+        # For now, we'll try processes, but fallback to threads if pickling fails
+        try:
+            results = [None] * len(tasks)
+            
+            # Execute tasks in parallel using processes
+            with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+                # Submit all tasks
+                future_to_index = {
+                    executor.submit(task): i
+                    for i, task in enumerate(tasks)
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        result = future.result()
+                        results[index] = result
+                    except Exception as e:
+                        results[index] = e
+            
+            return results
+        except Exception:
+            # Fallback to threads if process execution fails (e.g., unpicklable tasks)
+            return self._execute_nested_tasks_threads(tasks)
 

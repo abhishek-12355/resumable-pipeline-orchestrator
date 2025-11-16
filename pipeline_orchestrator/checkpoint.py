@@ -41,13 +41,14 @@ class PipelineCheckpointManager:
         else:
             self.manager = None
     
-    def save_result(self, module_name: str, result: Any) -> str:
+    def save_result(self, module_name: str, result: Any, is_error: bool = False) -> str:
         """
         Save module result as checkpoint.
         
         Args:
             module_name: Name of the module
-            result: Result object to save
+            result: Result object or error to save
+            is_error: Whether result is an error/exception
             
         Returns:
             Path to saved checkpoint file
@@ -60,14 +61,36 @@ class PipelineCheckpointManager:
         
         checkpoint_name = f"{module_name}_result"
         
+        # Prepare error data if it's an exception
+        if is_error and isinstance(result, Exception):
+            error_data = {
+                "error_type": type(result).__name__,
+                "error_message": str(result),
+                "error_repr": repr(result)
+            }
+            # Try to serialize exception if possible
+            try:
+                import pickle
+                error_data["error_pickled"] = pickle.dumps(result)
+            except Exception:
+                pass
+            data_to_save = error_data
+            status = "failed"
+            description = f"Error from module {module_name}"
+        else:
+            data_to_save = result
+            status = "completed" if not is_error else "failed"
+            description = f"Result from module {module_name}"
+        
         try:
             file_path = self.manager.save(
                 name=checkpoint_name,
-                data=result,
-                description=f"Result from module {module_name}",
+                data=data_to_save,
+                description=description,
                 custom_metadata={
                     "module_name": module_name,
-                    "status": "completed"
+                    "status": status,
+                    "is_error": is_error
                 }
             )
             return file_path

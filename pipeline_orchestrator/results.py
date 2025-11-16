@@ -50,26 +50,28 @@ class ResultsManager:
                     # Skip if checkpoint load fails
                     pass
     
-    def save_result(self, module_name: str, result: Any):
+    def save_result(self, module_name: str, result: Any, is_error: bool = False):
         """
         Save module result (in-memory and checkpoint).
         
         Args:
             module_name: Name of the module
-            result: Result object to save
+            result: Result object or error to save
+            is_error: Whether result is an error/exception
         """
-        # Store in memory
+        # Store in memory (even errors)
         self._results[module_name] = result
         
-        # Save to checkpoint if enabled
+        # Save to checkpoint if enabled (always checkpoint, even failures)
         if self.checkpoint_manager and self.checkpoint_manager.enabled:
             try:
-                self.checkpoint_manager.save_result(module_name, result)
+                self.checkpoint_manager.save_result(module_name, result, is_error=is_error)
             except Exception:
                 # Log but don't fail if checkpoint save fails
                 pass
         
-        # Mark as completed in dependency graph
+        # Mark as completed in dependency graph (even if failed)
+        # This allows downstream modules to know the module was attempted
         self.dependency_graph.mark_completed(module_name)
     
     def get_result(self, module_name: str) -> Any:

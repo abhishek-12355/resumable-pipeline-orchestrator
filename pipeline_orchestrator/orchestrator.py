@@ -145,6 +145,18 @@ class PipelineOrchestrator:
                     all_results[module_name] = e
                     continue
                 
+                # Get PyTorch device strings and GPU names for allocated GPUs
+                pytorch_devices = []
+                gpu_names = []
+                for gpu_id in assigned_gpus:
+                    pytorch_device = self.resource_manager.get_pytorch_device(gpu_id)
+                    pytorch_devices.append(pytorch_device)
+                    gpu_name = self.resource_manager.get_gpu_name(gpu_id)
+                    if gpu_name:
+                        gpu_names.append(gpu_name)
+                    else:
+                        gpu_names.append(f"GPU {gpu_id}")
+                
                 # Create context
                 dependency_results = self.results_manager.get_dependency_results(module_name)
                 
@@ -161,7 +173,9 @@ class PipelineOrchestrator:
                         "cpus": cpus,
                         "gpus": gpus,
                         "gpu_ids": assigned_gpus,
-                        "cuda_visible_devices": cuda_visible
+                        "cuda_visible_devices": cuda_visible,
+                        "pytorch_devices": pytorch_devices,
+                        "gpu_names": gpu_names
                     },
                     dependency_results=dependency_results,
                     execute_tasks_fn=create_execute_tasks_fn(module_name)
@@ -205,27 +219,50 @@ class PipelineOrchestrator:
         Returns:
             List of results/errors in same order as tasks
         """
-        # For now, simplified implementation
-        # Full implementation would:
-        # 1. Validate resources for nested tasks
-        # 2. Execute tasks in parallel (using threads/processes)
-        # 3. Collect results/errors
-        # 4. Return results
+        if not tasks:
+            return []
         
-        results = []
+        # Validate all tasks are callable
+        for i, task in enumerate(tasks):
+            if not callable(task):
+                from pipeline_orchestrator.exceptions import NestedExecutionError
+                return [NestedExecutionError(f"Task {i} is not callable: {task}")] * len(tasks)
         
-        for task in tasks:
-            try:
-                if callable(task):
+        # Get execution configuration
+        execution_config = self.config.execution
+        worker_type = execution_config["worker_type"]
+        max_nested_depth = execution_config.get("max_nested_depth")
+        
+        # Validate nested depth (if limited)
+        # Note: We don't track depth currently, but could be added
+        if max_nested_depth is not None and max_nested_depth <= 0:
+            from pipeline_orchestrator.exceptions import NestedExecutionError
+            return [NestedExecutionError("Maximum nested execution depth exceeded")] * len(tasks)
+        
+        # Execute tasks using executor's nested execution method
+        # For now, execute tasks sequentially to avoid resource conflicts
+        # In a full implementation, we would:
+        # 1. Check available resources
+        # 2. Reserve resources for nested tasks
+        # 3. Execute tasks in parallel based on worker_type
+        # 4. Release resources
+        # 5. Return results
+        
+        # For nested tasks, use simple parallel execution via executor
+        # The executor handles resource management
+        if isinstance(self.executor, ParallelExecutor):
+            # Use executor's nested task execution
+            return self.executor._execute_nested_tasks(tasks, self.results_manager)
+        else:
+            # Sequential executor - execute tasks sequentially
+            results = []
+            for task in tasks:
+                try:
                     result = task()
                     results.append(result)
-                else:
-                    from pipeline_orchestrator.exceptions import NestedExecutionError
-                    results.append(NestedExecutionError(f"Task is not callable: {task}"))
-            except Exception as e:
-                results.append(e)
-        
-        return results
+                except Exception as e:
+                    results.append(e)
+            return results
     
     def get_results(self) -> Dict[str, Any]:
         """

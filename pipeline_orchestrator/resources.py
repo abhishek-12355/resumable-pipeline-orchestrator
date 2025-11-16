@@ -50,7 +50,7 @@ class ResourceManager:
     
     def _detect_gpu_count(self) -> int:
         """Detect number of available GPUs."""
-        # Try nvidia-smi first
+        # Try nvidia-smi first (NVIDIA GPUs)
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--list-gpus"],
@@ -59,18 +59,72 @@ class ResourceManager:
                 timeout=5
             )
             if result.returncode == 0:
-                return len(result.stdout.strip().split('\n'))
+                gpu_list = result.stdout.strip().split('\n')
+                if gpu_list and gpu_list[0]:  # Check if not empty
+                    return len(gpu_list)
         except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
             pass
         
-        # Try pynvml as fallback
+        # Try pynvml as fallback (NVIDIA GPUs)
         try:
             import pynvml
             pynvml.nvmlInit()
             count = pynvml.nvmlDeviceGetCount()
             pynvml.nvmlShutdown()
-            return count
+            if count > 0:
+                return count
         except (ImportError, Exception):
+            pass
+        
+        # Try Apple Silicon/Metal GPU detection (macOS)
+        try:
+            import platform
+            if platform.system() == "Darwin":  # macOS
+                # Use system_profiler to detect Metal GPUs
+                result = subprocess.run(
+                    ["system_profiler", "SPDisplaysDataType"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    # Count GPU entries (look for "Chipset Model" or "Metal" keywords)
+                    output = result.stdout
+                    # Look for Metal-capable GPUs
+                    # Apple Silicon always has integrated GPU
+                    # Intel Macs may have discrete GPUs
+                    if "Metal:" in output or "Chipset Model:" in output:
+                        # Count unique GPU chipsets
+                        # For Apple Silicon, typically 1 GPU (unified memory)
+                        # For Intel Macs, may have integrated + discrete
+                        gpu_count = output.count("Chipset Model:")
+                        # Metal should be supported
+                        if "Metal:" in output and gpu_count == 0:
+                            # No chipset info but Metal present - likely Apple Silicon
+                            gpu_count = 1
+                        if gpu_count > 0:
+                            return gpu_count
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        except Exception:
+            pass
+        
+        # Try checking for Metal framework (macOS specific)
+        try:
+            import platform
+            if platform.system() == "Darwin":
+                # On macOS, assume 1 GPU if we're on Apple Silicon
+                # or check Metal availability
+                result = subprocess.run(
+                    ["uname", "-m"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and "arm64" in result.stdout:
+                    # Apple Silicon - always has integrated GPU
+                    return 1
+        except Exception:
             pass
         
         # No GPUs detected
@@ -342,4 +396,159 @@ class ResourceManager:
                 "allocated_modules": list(self._allocated_to_modules.keys()),
                 "borrowed_tasks": list(self._borrowed_for_nested.keys())
             }
+    
+    def get_gpu_name(self, gpu_index: int = 0) -> Optional[str]:
+        """
+        Get GPU name/model for a specific GPU index.
+        
+        Args:
+            gpu_index: GPU index (0-indexed)
+            
+        Returns:
+            GPU name/model string or None if not available/not found
+        """
+        if gpu_index < 0 or gpu_index >= self.max_gpus:
+            return None
+        
+        # Try nvidia-smi for NVIDIA GPUs
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader", f"--id={gpu_index}"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                gpu_name = result.stdout.strip()
+                if gpu_name:
+                    return gpu_name
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        
+        # Try pynvml for NVIDIA GPUs
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+            gpu_name = pynvml.nvmlDeviceGetName(handle)
+            pynvml.nvmlShutdown()
+            if gpu_name:
+                return gpu_name.decode('utf-8') if isinstance(gpu_name, bytes) else gpu_name
+        except (ImportError, Exception):
+            pass
+        
+        # Try Apple Silicon/Metal GPU (macOS)
+        try:
+            import platform
+            if platform.system() == "Darwin":
+                result = subprocess.run(
+                    ["system_profiler", "SPDisplaysDataType"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    output = result.stdout
+                    # Look for "Chipset Model:" line
+                    lines = output.split('\n')
+                    chipset_models = []
+                    for i, line in enumerate(lines):
+                        if "Chipset Model:" in line:
+                            model = line.split("Chipset Model:")[-1].strip()
+                            if model:
+                                chipset_models.append(model)
+                    
+                    # For Apple Silicon, typically 1 GPU
+                    if chipset_models and gpu_index < len(chipset_models):
+                        return chipset_models[gpu_index]
+                    elif chipset_models:
+                        # Return first model if index out of range
+                        return chipset_models[0]
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        except Exception:
+            pass
+        
+        return None
+    
+    def get_pytorch_device(self, gpu_index: int = 0) -> str:
+        """
+        Get PyTorch device string for a GPU index.
+        
+        For NVIDIA GPUs: returns "cuda:0", "cuda:1", etc.
+        For Apple Silicon/Metal GPUs: returns "mps:0"
+        If no GPU or invalid index: returns "cpu"
+        
+        Args:
+            gpu_index: GPU index (0-indexed)
+            
+        Returns:
+            PyTorch device string (e.g., "cuda:0", "mps:0", "cpu")
+        """
+        if gpu_index < 0 or gpu_index >= self.max_gpus:
+            return "cpu"
+        
+        # Check if NVIDIA GPU
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--list-gpus"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # NVIDIA GPU
+                return f"cuda:{gpu_index}"
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        
+        # Check if Apple Silicon/Metal GPU
+        try:
+            import platform
+            if platform.system() == "Darwin":
+                # Check for Apple Silicon (arm64)
+                result = subprocess.run(
+                    ["uname", "-m"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and "arm64" in result.stdout:
+                    # Apple Silicon with Metal Performance Shaders
+                    return f"mps:{gpu_index}"
+        except Exception:
+            pass
+        
+        # Default to CPU
+        return "cpu"
+    
+    def get_all_gpu_names(self) -> List[str]:
+        """
+        Get names/models for all available GPUs.
+        
+        Returns:
+            List of GPU names/models (one per GPU)
+        """
+        gpu_names = []
+        for i in range(self.max_gpus):
+            name = self.get_gpu_name(i)
+            if name:
+                gpu_names.append(name)
+            else:
+                gpu_names.append(f"GPU {i}")
+        return gpu_names
+    
+    def get_all_pytorch_devices(self) -> List[str]:
+        """
+        Get PyTorch device strings for all available GPUs.
+        
+        Returns:
+            List of PyTorch device strings (e.g., ["cuda:0", "cuda:1"] or ["mps:0"])
+        """
+        devices = []
+        for i in range(self.max_gpus):
+            device = self.get_pytorch_device(i)
+            if device != "cpu":
+                devices.append(device)
+        return devices
 

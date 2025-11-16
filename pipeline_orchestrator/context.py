@@ -1,5 +1,6 @@
 """Execution context for modules."""
 
+import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
 from pipeline_orchestrator.exceptions import DependencyError
@@ -22,7 +23,7 @@ class ModuleContext:
         Args:
             module_name: Name of the current module
             pipeline_name: Name of the pipeline
-            resources: Resource allocation (cpus, gpus, gpu_ids)
+            resources: Resource allocation (cpus, gpus, gpu_ids, cuda_visible_devices, pytorch_devices, gpu_names)
             dependency_results: Dictionary of dependency results
             execute_tasks_fn: Function to execute nested tasks (optional)
         """
@@ -105,4 +106,51 @@ class ModuleContext:
             )
         
         return self._execute_tasks_fn(tasks)
+    
+    def get_pytorch_device(self, gpu_index: int = 0) -> str:
+        """
+        Get PyTorch device string for the allocated GPU.
+        
+        For NVIDIA GPUs: returns "cuda:0", "cuda:1", etc.
+        For Apple Silicon/Metal GPUs: returns "mps:0"
+        If no GPU allocated or invalid index: returns "cpu"
+        
+        Args:
+            gpu_index: GPU index within allocated GPUs (default: 0, first GPU)
+            
+        Returns:
+            PyTorch device string (e.g., "cuda:0", "mps:0", "cpu")
+        """
+        # Get PyTorch device strings from resources
+        pytorch_devices = self.resources.get("pytorch_devices", [])
+        
+        if not pytorch_devices:
+            return "cpu"
+        
+        if gpu_index < 0 or gpu_index >= len(pytorch_devices):
+            # Use first GPU if index out of range
+            gpu_index = 0
+        
+        return pytorch_devices[gpu_index]
+    
+    def get_gpu_name(self, gpu_index: int = 0) -> Optional[str]:
+        """
+        Get GPU name/model for the allocated GPU.
+        
+        Args:
+            gpu_index: GPU index within allocated GPUs (default: 0, first GPU)
+            
+        Returns:
+            GPU name/model string or None if not available/not found
+        """
+        # Get GPU names from resources
+        gpu_names = self.resources.get("gpu_names", [])
+        
+        if not gpu_names:
+            return None
+        
+        if gpu_index < 0 or gpu_index >= len(gpu_names):
+            gpu_index = 0
+        
+        return gpu_names[gpu_index]
 
