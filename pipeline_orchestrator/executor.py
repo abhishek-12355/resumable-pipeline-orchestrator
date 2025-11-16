@@ -271,15 +271,15 @@ class ParallelExecutor(BaseExecutor):
                         logger.debug(f"Module {module_name} completed successfully")
                         results[module_name] = result
                         results_manager.save_result(module_name, result, is_error=False)
-                    except Exception as e:
-                        results[module_name] = e
-                        # Checkpoint failed module
-                        results_manager.save_result(module_name, e, is_error=True)
-                        if self.failure_policy == "fail_fast":
-                            for f in futures:
-                                if not f.done():
-                                    f.cancel()
-                            break
+                except Exception as e:
+                    results[module_name] = e
+                    # Checkpoint failed module
+                    results_manager.save_result(module_name, e, is_error=True)
+                    if self.failure_policy == "fail_fast":
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        break
         
         return results
     

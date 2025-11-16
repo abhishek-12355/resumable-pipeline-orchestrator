@@ -32,7 +32,7 @@ class ResourceManager:
         )
         
         # Resource allocation tracking
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         
         # Allocated to modules: {module_name: {"cpus": int, "gpus": List[int]}}
         self._allocated_to_modules: Dict[str, Dict] = {}

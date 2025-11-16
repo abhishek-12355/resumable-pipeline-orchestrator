@@ -1,0 +1,19 @@
+pipeline:
+  name: "sample_pipeline"
+  execution:
+    mode: "parallel"  # parallel (default) or sequential
+    worker_type: "process"  # thread or process
+    failure_policy: "fail_fast"  # fail_fast or collect_all
+  resources:
+    max_cpus: 4
+    max_gpus: 2
+  checkpoint:
+    enabled: true
+    directory: "./checkpoints"
+  modules: 
+    - name: "hello_world"
+      path: "examples.modules:HelloWorldModule"
+      depends_on: []
+      resources:
+        cpus: 1
+        gpus: 0

@@ -36,11 +36,6 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["pynvml>=11.0"]
 dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "black>=23.0",
-    "flake8>=6.0",
-    "mypy>=1.0",
 ]
 
 [project.urls]
@@ -63,4 +58,7 @@ python_version = "3.8"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+
+[tool.uv.sources]
+checkpoint-manager = { path = "../checkpoint-manager", editable = true }
 
