@@ -14,6 +14,9 @@ from pipeline_orchestrator.ipc import WorkerIPCManager, NestedTaskRequest, Neste
 from pipeline_orchestrator.module import BaseModule
 from pipeline_orchestrator.context import ModuleContext
 from pipeline_orchestrator.results import ResultsManager
+from pipeline_orchestrator.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class BaseExecutor(ABC):
@@ -79,10 +82,13 @@ class SequentialExecutor(BaseExecutor):
         context: ModuleContext
     ) -> Any:
         """Execute a module sequentially."""
+        logger.debug(f"Executing module: {module_name}")
         try:
             result = module.run(context)
+            logger.debug(f"Module {module_name} completed successfully")
             return result
         except Exception as e:
+            logger.error(f"Module {module_name} execution failed: {e}", exc_info=True)
             raise ModuleExecutionError(f"Module '{module_name}' execution failed: {e}") from e
     
     def execute_modules(
@@ -92,16 +98,20 @@ class SequentialExecutor(BaseExecutor):
         results_manager: ResultsManager
     ) -> Dict[str, Any]:
         """Execute modules sequentially."""
+        logger.info(f"Sequential executor: Executing {len(modules)} module(s)")
         results = {}
         
         for module_name, module in modules.items():
             context = contexts[module_name]
+            logger.info(f"Executing module: {module_name}")
             
             try:
                 result = self.execute_module(module_name, module, context)
                 results[module_name] = result
                 results_manager.save_result(module_name, result, is_error=False)
+                logger.info(f"Module {module_name} completed successfully")
             except Exception as e:
+                logger.error(f"Module {module_name} failed: {e}")
                 results[module_name] = e
                 # Checkpoint failed module
                 results_manager.save_result(module_name, e, is_error=True)
@@ -119,10 +129,14 @@ class _ModuleWorker:
         context: ModuleContext
     ) -> Tuple[str, Any]:
         """Thread worker function."""
+        worker_logger = get_logger(__name__)
+        worker_logger.debug(f"Thread worker starting: {module_name}")
         try:
             result = module.run(context)
+            worker_logger.debug(f"Thread worker completed: {module_name}")
             return (module_name, result)
         except Exception as e:
+            worker_logger.error(f"Thread worker failed: {module_name}: {e}", exc_info=True)
             return (module_name, ModuleExecutionError(f"Module '{module_name}' execution failed: {e}"))
     
     @staticmethod
@@ -134,9 +148,15 @@ class _ModuleWorker:
         ipc_client: Optional[Any]
     ) -> Tuple[str, Any]:
         """Process worker function."""
+        # Set up logging in worker process
+        worker_logger = get_logger(__name__)
+        worker_logger.debug(f"Process worker starting: {module_name} (worker_id: {worker_id})")
+        
         # Set CUDA_VISIBLE_DEVICES if GPUs allocated
         if context.resources.get("cuda_visible_devices"):
-            os.environ["CUDA_VISIBLE_DEVICES"] = context.resources["cuda_visible_devices"]
+            cuda_devices = context.resources["cuda_visible_devices"]
+            os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+            worker_logger.debug(f"Set CUDA_VISIBLE_DEVICES={cuda_devices} for {module_name}")
         
         try:
             # Update context to use IPC client for nested execution
@@ -144,8 +164,10 @@ class _ModuleWorker:
                 context._execute_tasks_fn = lambda tasks: ipc_client.execute_tasks(tasks)
             
             result = module.run(context)
+            worker_logger.debug(f"Process worker completed: {module_name}")
             return (module_name, result)
         except Exception as e:
+            worker_logger.error(f"Process worker failed: {module_name}: {e}", exc_info=True)
             return (module_name, ModuleExecutionError(f"Module '{module_name}' execution failed: {e}"))
 
 
@@ -211,6 +233,7 @@ class ParallelExecutor(BaseExecutor):
         results_manager: ResultsManager
     ) -> Dict[str, Any]:
         """Execute modules using threads."""
+        logger.info(f"Parallel executor (threads): Executing {len(modules)} module(s)")
         results = {}
         futures: Dict[Future, str] = {}
         
@@ -233,16 +256,19 @@ class ParallelExecutor(BaseExecutor):
                     _, result = future.result()
                     
                     if isinstance(result, Exception):
+                        logger.error(f"Module {module_name} failed: {result}")
                         results[module_name] = result
                         # Checkpoint failed module
                         results_manager.save_result(module_name, result, is_error=True)
                         if self.failure_policy == "fail_fast":
+                            logger.warning("Fail-fast policy: Cancelling remaining tasks")
                             # Cancel remaining futures
                             for f in futures:
                                 if not f.done():
                                     f.cancel()
                             break
                     else:
+                        logger.debug(f"Module {module_name} completed successfully")
                         results[module_name] = result
                         results_manager.save_result(module_name, result, is_error=False)
                     except Exception as e:
@@ -264,10 +290,12 @@ class ParallelExecutor(BaseExecutor):
         results_manager: ResultsManager
     ) -> Dict[str, Any]:
         """Execute modules using processes."""
+        logger.info(f"Parallel executor (processes): Executing {len(modules)} module(s)")
         results = {}
         futures: Dict[Future, str] = {}
         
         # Create IPC clients for each worker
+        logger.debug("Setting up IPC channels for worker processes")
         worker_clients = {}
         for module_name in modules:
             worker_id = f"worker_{module_name}_{id(modules[module_name])}"
@@ -276,8 +304,10 @@ class ParallelExecutor(BaseExecutor):
             from pipeline_orchestrator.ipc import WorkerIPCClient
             ipc_client = WorkerIPCClient(worker_id, request_queue, response_queue)
             worker_clients[module_name] = (worker_id, ipc_client)
+            logger.debug(f"Created IPC channel for {module_name}: {worker_id}")
         
         # Start nested execution handler in background thread
+        logger.debug("Starting nested execution handler thread")
         nested_handler = threading.Thread(
             target=self._handle_nested_execution,
             args=(results_manager,),
@@ -311,29 +341,35 @@ class ParallelExecutor(BaseExecutor):
                         _, result = future.result()
                         
                         if isinstance(result, Exception):
+                            logger.error(f"Module {module_name} failed: {result}")
                             results[module_name] = result
                             # Checkpoint failed module
                             results_manager.save_result(module_name, result, is_error=True)
                             if self.failure_policy == "fail_fast":
+                                logger.warning("Fail-fast policy: Cancelling remaining tasks")
                                 # Cancel remaining futures
                                 for f in futures:
                                     if not f.done():
                                         f.cancel()
                                 break
                         else:
+                            logger.debug(f"Module {module_name} completed successfully")
                             results[module_name] = result
                             results_manager.save_result(module_name, result, is_error=False)
                     except Exception as e:
+                        logger.error(f"Exception while waiting for {module_name}: {e}", exc_info=True)
                         results[module_name] = e
                         # Checkpoint failed module
                         results_manager.save_result(module_name, e, is_error=True)
                         if self.failure_policy == "fail_fast":
+                            logger.warning("Fail-fast policy: Cancelling remaining tasks")
                             for f in futures:
                                 if not f.done():
                                     f.cancel()
                             break
         finally:
             # Cleanup IPC channels
+            logger.debug("Cleaning up IPC channels")
             for module_name, (worker_id, _) in worker_clients.items():
                 self.ipc_manager.remove_channel(worker_id)
         
@@ -341,6 +377,8 @@ class ParallelExecutor(BaseExecutor):
     
     def _handle_nested_execution(self, results_manager: ResultsManager):
         """Handle nested execution requests from worker processes."""
+        handler_logger = get_logger(__name__)
+        handler_logger.debug("Nested execution handler thread started")
         while True:
             # Check for nested execution requests
             requests = self.ipc_manager.wait_for_requests(timeout=0.1)
@@ -349,6 +387,10 @@ class ParallelExecutor(BaseExecutor):
                 if not isinstance(request, NestedTaskRequest):
                     continue
                 
+                handler_logger.debug(
+                    f"Handling nested execution request from {worker_id}: "
+                    f"{len(request.tasks)} task(s)"
+                )
                 try:
                     # Execute nested tasks
                     # Note: This is a simplified version
@@ -358,7 +400,14 @@ class ParallelExecutor(BaseExecutor):
                     # Send response
                     response = NestedTaskResponse(request.task_id, results)
                     self.ipc_manager.send_response(worker_id, response)
+                    handler_logger.debug(
+                        f"Nested execution completed for {worker_id}: "
+                        f"{sum(1 for r in results if not isinstance(r, Exception))}/{len(results)} succeeded"
+                    )
                 except Exception as e:
+                    handler_logger.error(
+                        f"Nested execution failed for {worker_id}: {e}", exc_info=True
+                    )
                     # Send error response
                     error_response = NestedTaskResponse(
                         request.task_id,
@@ -386,9 +435,12 @@ class ParallelExecutor(BaseExecutor):
         if not tasks:
             return []
         
+        logger.debug(f"Executing {len(tasks)} nested task(s) using {self.worker_type} workers")
+        
         # Validate all tasks are callable
         for i, task in enumerate(tasks):
             if not callable(task):
+                logger.error(f"Nested task {i} is not callable: {task}")
                 return [NestedExecutionError(f"Task {i} is not callable: {task}")] * len(tasks)
         
         # Execute tasks in parallel based on worker type
@@ -409,6 +461,7 @@ class ParallelExecutor(BaseExecutor):
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
+        logger.debug(f"Executing {len(tasks)} nested task(s) using threads")
         results = [None] * len(tasks)
         
         # Execute tasks in parallel using threads
@@ -426,8 +479,11 @@ class ParallelExecutor(BaseExecutor):
                     result = future.result()
                     results[index] = result
                 except Exception as e:
+                    logger.warning(f"Nested task {index} failed: {e}")
                     results[index] = e
         
+        successful = sum(1 for r in results if not isinstance(r, Exception))
+        logger.debug(f"Nested tasks completed: {successful}/{len(results)} succeeded")
         return results
     
     def _execute_nested_tasks_processes(self, tasks: List[Any]) -> List[Any]:
@@ -444,6 +500,7 @@ class ParallelExecutor(BaseExecutor):
         
         # Note: Tasks must be picklable for multiprocessing
         # For now, we'll try processes, but fallback to threads if pickling fails
+        logger.debug(f"Executing {len(tasks)} nested task(s) using processes")
         try:
             results = [None] * len(tasks)
             
@@ -462,10 +519,16 @@ class ParallelExecutor(BaseExecutor):
                         result = future.result()
                         results[index] = result
                     except Exception as e:
+                        logger.warning(f"Nested task {index} failed: {e}")
                         results[index] = e
             
+            successful = sum(1 for r in results if not isinstance(r, Exception))
+            logger.debug(f"Nested tasks completed: {successful}/{len(results)} succeeded")
             return results
-        except Exception:
+        except Exception as e:
             # Fallback to threads if process execution fails (e.g., unpicklable tasks)
+            logger.warning(
+                f"Process execution failed for nested tasks, falling back to threads: {e}"
+            )
             return self._execute_nested_tasks_threads(tasks)
 

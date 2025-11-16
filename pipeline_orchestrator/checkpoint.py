@@ -11,6 +11,9 @@ except ImportError:
     )
 
 from pipeline_orchestrator.exceptions import CheckpointError
+from pipeline_orchestrator.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class PipelineCheckpointManager:
@@ -29,6 +32,7 @@ class PipelineCheckpointManager:
         
         if self.enabled:
             try:
+                logger.info(f"Initializing checkpoint manager: {self.checkpoint_directory}")
                 # Create checkpoint manager configuration
                 config = CheckpointManagerConfig(
                     checkpoint_dir=str(self.checkpoint_directory)
@@ -36,10 +40,13 @@ class PipelineCheckpointManager:
                 
                 # Initialize checkpoint manager
                 self.manager = CheckpointManager(config=config)
+                logger.debug("Checkpoint manager initialized successfully")
             except Exception as e:
+                logger.error(f"Failed to initialize checkpoint manager: {e}")
                 raise CheckpointError(f"Failed to initialize checkpoint manager: {e}")
         else:
             self.manager = None
+            logger.debug("Checkpoint manager disabled")
     
     def save_result(self, module_name: str, result: Any, is_error: bool = False) -> str:
         """
@@ -83,6 +90,7 @@ class PipelineCheckpointManager:
             description = f"Result from module {module_name}"
         
         try:
+            logger.debug(f"Saving checkpoint for {module_name} (is_error={is_error})")
             file_path = self.manager.save(
                 name=checkpoint_name,
                 data=data_to_save,
@@ -93,8 +101,10 @@ class PipelineCheckpointManager:
                     "is_error": is_error
                 }
             )
+            logger.debug(f"Checkpoint saved for {module_name}: {file_path}")
             return file_path
         except Exception as e:
+            logger.error(f"Failed to save checkpoint for {module_name}: {e}")
             raise CheckpointError(f"Failed to save checkpoint for module '{module_name}': {e}")
     
     def load_result(self, module_name: str) -> Tuple[Any, Dict]:
@@ -116,9 +126,12 @@ class PipelineCheckpointManager:
         checkpoint_name = f"{module_name}_result"
         
         try:
+            logger.debug(f"Loading checkpoint for {module_name}")
             result, metadata = self.manager.load(checkpoint_name)
+            logger.debug(f"Checkpoint loaded for {module_name}")
             return result, metadata
         except Exception as e:
+            logger.error(f"Failed to load checkpoint for {module_name}: {e}")
             raise CheckpointError(
                 f"Failed to load checkpoint for module '{module_name}': {e}"
             )

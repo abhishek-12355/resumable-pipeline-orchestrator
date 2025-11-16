@@ -9,6 +9,9 @@ from typing import Any, Callable, Dict, Optional
 
 from pipeline_orchestrator.exceptions import ConfigurationError
 from pipeline_orchestrator.context import ModuleContext
+from pipeline_orchestrator.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class BaseModule(ABC):
@@ -112,12 +115,15 @@ class ModuleLoader:
         
         module_path, class_name = path.rsplit(":", 1)
         
+        logger.debug(f"Loading class-based module: {module_path}.{class_name}")
         try:
             # Import module
             module = importlib.import_module(module_path)
+            logger.debug(f"Imported module: {module_path}")
             
             # Get class
             if not hasattr(module, class_name):
+                logger.error(f"Class '{class_name}' not found in module '{module_path}'")
                 raise ConfigurationError(
                     f"Class '{class_name}' not found in module '{module_path}'"
                 )
@@ -127,7 +133,9 @@ class ModuleLoader:
             # Instantiate (assuming no required arguments)
             try:
                 instance = cls()
+                logger.debug(f"Instantiated class: {class_name}")
             except TypeError as e:
+                logger.error(f"Failed to instantiate class '{class_name}': {e}")
                 raise ConfigurationError(
                     f"Failed to instantiate class '{class_name}': {e}. "
                     f"Class should have no required arguments or accept context parameter."
@@ -135,18 +143,25 @@ class ModuleLoader:
             
             # Check if it's a BaseModule or has run method
             if isinstance(instance, BaseModule):
+                logger.debug(f"Module {class_name} is a BaseModule")
                 return instance
             elif hasattr(instance, "run") and callable(getattr(instance, "run")):
                 # Wrap in adapter if it's not BaseModule but has run method
+                logger.debug(f"Wrapping module {class_name} with adapter")
                 return _ModuleWrapper(instance)
             else:
+                logger.error(
+                    f"Class '{class_name}' must be a subclass of BaseModule or have a 'run' method"
+                )
                 raise ConfigurationError(
                     f"Class '{class_name}' must be a subclass of BaseModule or have a 'run' method"
                 )
         
         except ImportError as e:
+            logger.error(f"Failed to import module '{module_path}': {e}")
             raise ConfigurationError(f"Failed to import module '{module_path}': {e}")
         except Exception as e:
+            logger.error(f"Failed to load module from path '{path}': {e}")
             raise ConfigurationError(f"Failed to load module from path '{path}': {e}")
     
     @staticmethod
@@ -170,25 +185,31 @@ class ModuleLoader:
         
         script_path_obj = Path(file_path)
         if not script_path_obj.exists():
+            logger.error(f"Script file not found: {file_path}")
             raise ConfigurationError(f"Script file not found: {file_path}")
         
+        logger.debug(f"Loading function-based module: {file_path}:{function_name}")
         try:
             # Add script directory to path
             script_dir = str(script_path_obj.parent)
             if script_dir not in sys.path:
                 sys.path.insert(0, script_dir)
+                logger.debug(f"Added {script_dir} to sys.path")
             
             # Load module from file
             module_name = script_path_obj.stem
             spec = importlib.util.spec_from_file_location(module_name, str(script_path_obj))
             if spec is None or spec.loader is None:
+                logger.error(f"Failed to load spec for script: {file_path}")
                 raise ConfigurationError(f"Failed to load spec for script: {file_path}")
             
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            logger.debug(f"Loaded script module: {module_name}")
             
             # Get function
             if not hasattr(module, function_name):
+                logger.error(f"Function '{function_name}' not found in script '{file_path}'")
                 raise ConfigurationError(
                     f"Function '{function_name}' not found in script '{file_path}'"
                 )
@@ -196,13 +217,16 @@ class ModuleLoader:
             func = getattr(module, function_name)
             
             if not callable(func):
+                logger.error(f"'{function_name}' in script '{file_path}' is not callable")
                 raise ConfigurationError(
                     f"'{function_name}' in script '{file_path}' is not callable"
                 )
             
+            logger.debug(f"Loaded function: {function_name}")
             return FunctionModuleAdapter(func)
         
         except Exception as e:
+            logger.error(f"Failed to load function from script '{script_path}': {e}")
             raise ConfigurationError(f"Failed to load function from script '{script_path}': {e}")
 
 

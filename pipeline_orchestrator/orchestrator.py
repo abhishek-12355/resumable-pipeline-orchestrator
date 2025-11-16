@@ -17,6 +17,9 @@ from pipeline_orchestrator.exceptions import (
     ModuleExecutionError
 )
 from pipeline_orchestrator.ipc import WorkerIPCManager
+from pipeline_orchestrator.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class PipelineOrchestrator:
@@ -38,25 +41,43 @@ class PipelineOrchestrator:
         if config is None:
             if config_path is None:
                 raise ConfigurationError("Either config_path or config must be provided")
+            logger.info(f"Loading pipeline configuration from: {config_path}")
             self.config = PipelineConfig.from_yaml_file(config_path)
         else:
+            logger.info("Using provided pipeline configuration")
             self.config = config
+        
+        logger.info(f"Initializing pipeline orchestrator: {self.config.name}")
         
         # Initialize components
         self.dependency_graph = DependencyGraph(self.config)
+        logger.debug("Dependency graph initialized")
         
         # Resource manager
+        max_cpus = self.config.resources.get("max_cpus")
+        max_gpus = self.config.resources.get("max_gpus")
         self.resource_manager = ResourceManager(
-            max_cpus=self.config.resources.get("max_cpus"),
-            max_gpus=self.config.resources.get("max_gpus")
+            max_cpus=max_cpus,
+            max_gpus=max_gpus
+        )
+        logger.info(
+            f"Resource manager initialized: {self.resource_manager.total_cpus} CPUs, "
+            f"{self.resource_manager.total_gpus} GPUs"
         )
         
         # Checkpoint manager
         checkpoint_config = self.config.checkpoint
-        self.checkpoint_manager = PipelineCheckpointManager(
-            checkpoint_directory=checkpoint_config.get("directory", "./.checkpoints"),
-            enabled=checkpoint_config.get("enabled", True)
-        ) if checkpoint_config.get("enabled", True) else None
+        checkpoint_enabled = checkpoint_config.get("enabled", True)
+        if checkpoint_enabled:
+            checkpoint_dir = checkpoint_config.get("directory", "./.checkpoints")
+            self.checkpoint_manager = PipelineCheckpointManager(
+                checkpoint_directory=checkpoint_dir,
+                enabled=True
+            )
+            logger.info(f"Checkpoint manager initialized: {checkpoint_dir}")
+        else:
+            self.checkpoint_manager = None
+            logger.info("Checkpoint manager disabled")
         
         # Results manager
         self.results_manager = ResultsManager(
@@ -71,6 +92,7 @@ class PipelineOrchestrator:
         execution_config = self.config.execution
         if execution_config["mode"] == "sequential":
             self.executor = SequentialExecutor(self.resource_manager)
+            logger.info("Sequential executor initialized")
         else:
             self.executor = ParallelExecutor(
                 resource_manager=self.resource_manager,
@@ -78,6 +100,10 @@ class PipelineOrchestrator:
                 failure_policy=execution_config["failure_policy"],
                 max_nested_depth=execution_config.get("max_nested_depth"),
                 ipc_manager=self.ipc_manager
+            )
+            logger.info(
+                f"Parallel executor initialized: worker_type={execution_config['worker_type']}, "
+                f"failure_policy={execution_config['failure_policy']}"
             )
         
         # Module cache
@@ -88,11 +114,14 @@ class PipelineOrchestrator:
     
     def load_modules(self):
         """Load all modules from configuration."""
+        logger.info(f"Loading {len(self.config.modules)} modules")
         for module_config in self.config.modules:
             module_name = module_config["name"]
             if module_name not in self._modules:
+                logger.debug(f"Loading module: {module_name}")
                 module = ModuleLoader.load_module(module_config)
                 self._modules[module_name] = module
+                logger.debug(f"Module loaded: {module_name}")
     
     def execute(self) -> Dict[str, Any]:
         """
@@ -101,20 +130,27 @@ class PipelineOrchestrator:
         Returns:
             Dictionary mapping module names to results (or errors)
         """
+        logger.info(f"Starting pipeline execution: {self.config.name}")
+        
         # Load modules
         self.load_modules()
         
         # Get execution order (batches of parallelizable modules)
         execution_batches = self.dependency_graph.get_execution_order()
+        logger.info(f"Pipeline execution plan: {len(execution_batches)} batch(es)")
         
         # Execute batches sequentially, modules in batch in parallel
         all_results = {}
         
-        for batch in execution_batches:
+        for batch_idx, batch in enumerate(execution_batches, 1):
+            logger.info(f"Executing batch {batch_idx}/{len(execution_batches)}: {batch}")
             # Skip already completed modules
             batch = [m for m in batch if not self.dependency_graph.is_completed(m)]
             if not batch:
+                logger.debug(f"Batch {batch_idx}: All modules already completed, skipping")
                 continue
+            
+            logger.info(f"Batch {batch_idx}: Executing {len(batch)} module(s)")
             
             # Prepare modules and contexts for this batch
             batch_modules = {}
@@ -138,7 +174,12 @@ class PipelineOrchestrator:
                     assigned_gpus, cuda_visible = self.resource_manager.reserve_resources(
                         module_name, cpus, gpus
                     )
+                    logger.debug(
+                        f"Reserved resources for {module_name}: {cpus} CPUs, "
+                        f"{len(assigned_gpus)} GPUs {assigned_gpus if assigned_gpus else ''}"
+                    )
                 except ResourceError as e:
+                    logger.error(f"Failed to reserve resources for {module_name}: {e}")
                     if self.config.execution["failure_policy"] == "fail_fast":
                         raise
                     # In collect_all mode, mark as error and continue
@@ -185,6 +226,7 @@ class PipelineOrchestrator:
                 batch_contexts[module_name] = context
             
             # Execute batch
+            logger.info(f"Batch {batch_idx}: Starting execution of {len(batch_modules)} module(s)")
             batch_results = self.executor.execute_modules(
                 batch_modules,
                 batch_contexts,
@@ -194,18 +236,41 @@ class PipelineOrchestrator:
             # Release resources
             for module_name in batch:
                 self.resource_manager.release_resources(module_name)
+                logger.debug(f"Released resources for {module_name}")
             
             # Collect results
             all_results.update(batch_results)
+            
+            # Log batch completion
+            successful = sum(1 for r in batch_results.values() if not isinstance(r, Exception))
+            failed = len(batch_results) - successful
+            logger.info(
+                f"Batch {batch_idx} completed: {successful} succeeded, {failed} failed"
+            )
             
             # Check for failures in fail-fast mode
             if self.config.execution["failure_policy"] == "fail_fast":
                 for module_name, result in batch_results.items():
                     if isinstance(result, Exception):
+                        logger.error(
+                            f"Module {module_name} failed in fail-fast mode. "
+                            f"Stopping pipeline execution."
+                        )
                         # Stop execution on first failure
                         return all_results
         
         self._execution_results = all_results
+        
+        # Log final summary
+        total_modules = len(all_results)
+        successful_modules = sum(1 for r in all_results.values() if not isinstance(r, Exception))
+        failed_modules = total_modules - successful_modules
+        logger.info(
+            f"Pipeline execution completed: {successful_modules}/{total_modules} modules succeeded"
+        )
+        if failed_modules > 0:
+            logger.warning(f"{failed_modules} module(s) failed during execution")
+        
         return all_results
     
     def _execute_nested_tasks(self, requesting_module_name: str, tasks: List[Any]) -> List[Any]:
@@ -222,10 +287,17 @@ class PipelineOrchestrator:
         if not tasks:
             return []
         
+        logger.debug(
+            f"Module {requesting_module_name} requesting nested execution of {len(tasks)} task(s)"
+        )
+        
         # Validate all tasks are callable
         for i, task in enumerate(tasks):
             if not callable(task):
                 from pipeline_orchestrator.exceptions import NestedExecutionError
+                logger.error(
+                    f"Module {requesting_module_name}: Task {i} is not callable: {task}"
+                )
                 return [NestedExecutionError(f"Task {i} is not callable: {task}")] * len(tasks)
         
         # Get execution configuration
@@ -237,6 +309,9 @@ class PipelineOrchestrator:
         # Note: We don't track depth currently, but could be added
         if max_nested_depth is not None and max_nested_depth <= 0:
             from pipeline_orchestrator.exceptions import NestedExecutionError
+            logger.error(
+                f"Module {requesting_module_name}: Maximum nested execution depth exceeded"
+            )
             return [NestedExecutionError("Maximum nested execution depth exceeded")] * len(tasks)
         
         # Execute tasks using executor's nested execution method
@@ -252,15 +327,26 @@ class PipelineOrchestrator:
         # The executor handles resource management
         if isinstance(self.executor, ParallelExecutor):
             # Use executor's nested task execution
+            logger.debug(
+                f"Executing {len(tasks)} nested task(s) for {requesting_module_name} "
+                f"using parallel executor"
+            )
             return self.executor._execute_nested_tasks(tasks, self.results_manager)
         else:
             # Sequential executor - execute tasks sequentially
+            logger.debug(
+                f"Executing {len(tasks)} nested task(s) for {requesting_module_name} "
+                f"sequentially"
+            )
             results = []
-            for task in tasks:
+            for i, task in enumerate(tasks):
                 try:
                     result = task()
                     results.append(result)
                 except Exception as e:
+                    logger.warning(
+                        f"Nested task {i} for {requesting_module_name} failed: {e}"
+                    )
                     results.append(e)
             return results
     
@@ -287,6 +373,8 @@ class PipelineOrchestrator:
     
     def cleanup(self):
         """Cleanup resources."""
+        logger.info("Cleaning up pipeline orchestrator resources")
         if self.ipc_manager:
             self.ipc_manager.cleanup()
+            logger.debug("IPC manager cleaned up")
 

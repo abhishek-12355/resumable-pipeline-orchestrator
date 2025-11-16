@@ -13,6 +13,7 @@ from pipeline_orchestrator.exceptions import (
     CheckpointError,
     NestedExecutionError
 )
+from pipeline_orchestrator.logging_config import setup_logging, get_logger
 
 __version__ = "0.1.0"
 
@@ -32,5 +33,8 @@ __all__ = [
     "ModuleExecutionError",
     "CheckpointError",
     "NestedExecutionError",
+    # Logging
+    "setup_logging",
+    "get_logger",
 ]
 

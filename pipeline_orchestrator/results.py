@@ -5,6 +5,9 @@ from typing import Any, Dict, Optional
 from pipeline_orchestrator.exceptions import DependencyError
 from pipeline_orchestrator.checkpoint import PipelineCheckpointManager
 from pipeline_orchestrator.dependency import DependencyGraph
+from pipeline_orchestrator.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class ResultsManager:
@@ -34,9 +37,11 @@ class ResultsManager:
     def _load_completed_from_checkpoints(self):
         """Load completed modules from checkpoints on startup."""
         if not self.checkpoint_manager or not self.checkpoint_manager.enabled:
+            logger.debug("Checkpoint manager not enabled, skipping checkpoint load")
             return
         
         completed_modules = self.checkpoint_manager.list_completed_modules()
+        logger.info(f"Found {len(completed_modules)} completed module(s) in checkpoints")
         
         for module_name in completed_modules:
             # Mark as completed in dependency graph
@@ -46,8 +51,10 @@ class ResultsManager:
                     result, _ = self.checkpoint_manager.load_result(module_name)
                     self._results[module_name] = result
                     self.dependency_graph.mark_completed(module_name)
-                except Exception:
+                    logger.debug(f"Loaded checkpoint for module: {module_name}")
+                except Exception as e:
                     # Skip if checkpoint load fails
+                    logger.warning(f"Failed to load checkpoint for {module_name}: {e}")
                     pass
     
     def save_result(self, module_name: str, result: Any, is_error: bool = False):
@@ -65,9 +72,13 @@ class ResultsManager:
         # Save to checkpoint if enabled (always checkpoint, even failures)
         if self.checkpoint_manager and self.checkpoint_manager.enabled:
             try:
-                self.checkpoint_manager.save_result(module_name, result, is_error=is_error)
-            except Exception:
+                checkpoint_path = self.checkpoint_manager.save_result(module_name, result, is_error=is_error)
+                logger.debug(
+                    f"Saved {'error' if is_error else 'result'} checkpoint for {module_name}: {checkpoint_path}"
+                )
+            except Exception as e:
                 # Log but don't fail if checkpoint save fails
+                logger.warning(f"Failed to save checkpoint for {module_name}: {e}")
                 pass
         
         # Mark as completed in dependency graph (even if failed)
@@ -95,11 +106,14 @@ class ResultsManager:
         if self.checkpoint_manager and self.checkpoint_manager.enabled:
             if self.checkpoint_manager.has_checkpoint(module_name):
                 try:
+                    logger.debug(f"Loading result for {module_name} from checkpoint")
                     result, _ = self.checkpoint_manager.load_result(module_name)
                     # Cache in memory for future access
                     self._results[module_name] = result
+                    logger.debug(f"Loaded result for {module_name} from checkpoint")
                     return result
                 except Exception as e:
+                    logger.error(f"Failed to load checkpoint for {module_name}: {e}")
                     raise DependencyError(
                         f"Failed to load checkpoint for module '{module_name}': {e}"
                     )

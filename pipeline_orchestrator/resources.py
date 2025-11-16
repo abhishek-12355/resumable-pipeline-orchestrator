@@ -7,6 +7,9 @@ from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 from pipeline_orchestrator.exceptions import ResourceError
+from pipeline_orchestrator.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class ResourceManager:
@@ -22,6 +25,11 @@ class ResourceManager:
         """
         self.max_cpus = max_cpus or self._detect_cpu_count()
         self.max_gpus = max_gpus or self._detect_gpu_count()
+        
+        logger.info(
+            f"ResourceManager initialized: {self.max_cpus} CPUs, {self.max_gpus} GPUs "
+            f"(max_cpus={max_cpus}, max_gpus={max_gpus})"
+        )
         
         # Resource allocation tracking
         self._lock = threading.Lock()
@@ -42,11 +50,15 @@ class ResourceManager:
         """Detect number of available CPUs."""
         try:
             import psutil
-            return psutil.cpu_count(logical=True)
+            count = psutil.cpu_count(logical=True)
+            logger.debug(f"Detected {count} CPUs using psutil")
+            return count
         except ImportError:
             # Fallback to os.cpu_count()
             count = os.cpu_count()
-            return count if count else 1
+            count = count if count else 1
+            logger.debug(f"Detected {count} CPUs using os.cpu_count()")
+            return count
     
     def _detect_gpu_count(self) -> int:
         """Detect number of available GPUs."""
@@ -61,8 +73,11 @@ class ResourceManager:
             if result.returncode == 0:
                 gpu_list = result.stdout.strip().split('\n')
                 if gpu_list and gpu_list[0]:  # Check if not empty
-                    return len(gpu_list)
+                    count = len(gpu_list)
+                    logger.debug(f"Detected {count} GPU(s) using nvidia-smi")
+                    return count
         except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            logger.debug("nvidia-smi not available or failed")
             pass
         
         # Try pynvml as fallback (NVIDIA GPUs)
@@ -72,8 +87,10 @@ class ResourceManager:
             count = pynvml.nvmlDeviceGetCount()
             pynvml.nvmlShutdown()
             if count > 0:
+                logger.debug(f"Detected {count} GPU(s) using pynvml")
                 return count
         except (ImportError, Exception):
+            logger.debug("pynvml not available or failed")
             pass
         
         # Try Apple Silicon/Metal GPU detection (macOS)
@@ -128,6 +145,7 @@ class ResourceManager:
             pass
         
         # No GPUs detected
+        logger.debug("No GPUs detected")
         return 0
     
     @property
@@ -207,15 +225,24 @@ class ResourceManager:
         with self._lock:
             # Check if module already has resources allocated
             if module_name in self._allocated_to_modules:
+                logger.warning(f"Module '{module_name}' already has resources allocated")
                 raise ResourceError(f"Module '{module_name}' already has resources allocated")
             
             # Validate resource availability
             if cpus > self.available_cpus:
+                logger.error(
+                    f"Insufficient CPUs for {module_name}: requested {cpus}, "
+                    f"available {self.available_cpus}"
+                )
                 raise ResourceError(
                     f"Insufficient CPUs: requested {cpus}, available {self.available_cpus}"
                 )
             
             if gpus > self.available_gpus:
+                logger.error(
+                    f"Insufficient GPUs for {module_name}: requested {gpus}, "
+                    f"available {self.available_gpus}"
+                )
                 raise ResourceError(
                     f"Insufficient GPUs: requested {gpus}, available {self.available_gpus}"
                 )
@@ -244,6 +271,11 @@ class ResourceManager:
                 # We map assigned GPU indices to sequential 0, 1, 2, ...
                 cuda_visible = ",".join(str(gpu) for gpu in assigned_gpus)
             
+            logger.debug(
+                f"Reserved resources for {module_name}: {cpus} CPUs, "
+                f"{len(assigned_gpus)} GPUs {assigned_gpus if assigned_gpus else ''}"
+            )
+            
             return assigned_gpus, cuda_visible
     
     def release_resources(self, module_name: str):
@@ -255,10 +287,12 @@ class ResourceManager:
         """
         with self._lock:
             if module_name not in self._allocated_to_modules:
+                logger.debug(f"Module {module_name} has no resources to release")
                 return
             
             allocation = self._allocated_to_modules[module_name]
             gpus = allocation.get("gpus", [])
+            cpus = allocation.get("cpus", 0)
             
             # Release GPUs
             for gpu in gpus:
@@ -266,6 +300,11 @@ class ResourceManager:
             
             # Remove allocation
             del self._allocated_to_modules[module_name]
+            
+            logger.debug(
+                f"Released resources for {module_name}: {cpus} CPUs, "
+                f"{len(gpus)} GPUs {gpus if gpus else ''}"
+            )
     
     def borrow_resources(
         self,
@@ -290,15 +329,24 @@ class ResourceManager:
         with self._lock:
             # Check if task already has resources borrowed
             if task_id in self._borrowed_for_nested:
+                logger.warning(f"Task '{task_id}' already has resources borrowed")
                 raise ResourceError(f"Task '{task_id}' already has resources borrowed")
             
             # Validate resource availability
             if cpus > self.available_cpus:
+                logger.error(
+                    f"Insufficient CPUs for nested task {task_id}: requested {cpus}, "
+                    f"available {self.available_cpus}"
+                )
                 raise ResourceError(
                     f"Insufficient CPUs for nested task: requested {cpus}, available {self.available_cpus}"
                 )
             
             if gpus > self.available_gpus:
+                logger.error(
+                    f"Insufficient GPUs for nested task {task_id}: requested {gpus}, "
+                    f"available {self.available_gpus}"
+                )
                 raise ResourceError(
                     f"Insufficient GPUs for nested task: requested {gpus}, available {self.available_gpus}"
                 )
@@ -332,6 +380,11 @@ class ResourceManager:
             if assigned_gpus:
                 cuda_visible = ",".join(str(gpu) for gpu in assigned_gpus)
             
+            logger.debug(
+                f"Borrowed resources for nested task {task_id}: {cpus} CPUs, "
+                f"{len(assigned_gpus)} GPUs {assigned_gpus if assigned_gpus else ''}"
+            )
+            
             return assigned_gpus, cuda_visible
     
     def return_borrowed_resources(self, task_id: str):
@@ -343,12 +396,22 @@ class ResourceManager:
         """
         with self._lock:
             if task_id not in self._borrowed_for_nested:
+                logger.debug(f"Nested task {task_id} has no borrowed resources to return")
                 return
+            
+            allocation = self._borrowed_for_nested[task_id]
+            cpus = allocation.get("cpus", 0)
+            gpus = allocation.get("gpus", [])
             
             # Note: We don't track borrowed GPUs in _gpu_in_use
             # They're tracked separately in _borrowed_for_nested
             # So we just remove the record
             del self._borrowed_for_nested[task_id]
+            
+            logger.debug(
+                f"Returned borrowed resources for nested task {task_id}: {cpus} CPUs, "
+                f"{len(gpus)} GPUs {gpus if gpus else ''}"
+            )
     
     def validate_resources(self, cpus: int, gpus: int) -> bool:
         """
