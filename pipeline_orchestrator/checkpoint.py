@@ -12,6 +12,7 @@ except ImportError:
 
 from pipeline_orchestrator.exceptions import CheckpointError
 from pipeline_orchestrator.logging_config import get_logger
+from pipeline_orchestrator.module import BaseModule
 
 logger = get_logger(__name__)
 
@@ -48,7 +49,13 @@ class PipelineCheckpointManager:
             self.manager = None
             logger.debug("Checkpoint manager disabled")
     
-    def save_result(self, module_name: str, result: Any, is_error: bool = False) -> str:
+    def save_result(
+        self, 
+        module_name: str, 
+        result: Any, 
+        is_error: bool = False,
+        status: Optional[BaseModule.ModuleStatus] = None
+    ) -> str:
         """
         Save module result as checkpoint.
         
@@ -56,6 +63,7 @@ class PipelineCheckpointManager:
             module_name: Name of the module
             result: Result object or error to save
             is_error: Whether result is an error/exception
+            status: ModuleStatus enum value (if None, derived from is_error)
             
         Returns:
             Path to saved checkpoint file
@@ -67,6 +75,15 @@ class PipelineCheckpointManager:
             raise CheckpointError("Checkpointing is disabled")
         
         checkpoint_name = f"{module_name}_result"
+        
+        # Determine status
+        if status is not None:
+            # Use provided status enum value (convert to lowercase string)
+            status_str = status.value
+        elif is_error:
+            status_str = "failed"
+        else:
+            status_str = "success"
         
         # Prepare error data if it's an exception
         if is_error and isinstance(result, Exception):
@@ -82,22 +99,20 @@ class PipelineCheckpointManager:
             except Exception:
                 pass
             data_to_save = error_data
-            status = "failed"
             description = f"Error from module {module_name}"
         else:
             data_to_save = result
-            status = "completed" if not is_error else "failed"
             description = f"Result from module {module_name}"
         
         try:
-            logger.debug(f"Saving checkpoint for {module_name} (is_error={is_error})")
+            logger.debug(f"Saving checkpoint for {module_name} (status={status_str}, is_error={is_error})")
             file_path = self.manager.save(
                 name=checkpoint_name,
                 data=data_to_save,
                 description=description,
                 custom_metadata={
                     "module_name": module_name,
-                    "status": status,
+                    "status": status_str,
                     "is_error": is_error
                 }
             )
@@ -228,4 +243,46 @@ class PipelineCheckpointManager:
         except Exception:
             # Ignore errors during cleanup
             pass
+    
+    def get_module_status(self, module_name: str) -> Optional[BaseModule.ModuleStatus]:
+        """
+        Get module status from checkpoint metadata.
+        
+        Args:
+            module_name: Name of the module
+            
+        Returns:
+            ModuleStatus enum value or None if checkpoint doesn't exist
+        """
+        if not self.enabled:
+            return None
+        
+        metadata = self.get_checkpoint_metadata(module_name)
+        if metadata is None:
+            return None
+        
+        # Extract status from metadata
+        custom_metadata = metadata.get("custom_metadata", {})
+        status_str = custom_metadata.get("status")
+        
+        if status_str is None:
+            # Fallback: derive from is_error flag
+            is_error = custom_metadata.get("is_error", False)
+            status_str = "failed" if is_error else "success"
+        
+        # Map status string to enum
+        # Handle backward compatibility: "completed" -> "success"
+        if status_str == "completed":
+            status_str = "success"
+        
+        # Map to enum value
+        status_map = {
+            "not_started": BaseModule.ModuleStatus.NOT_STARTED,
+            "pending": BaseModule.ModuleStatus.PENDING,
+            "in_progress": BaseModule.ModuleStatus.IN_PROGRESS,
+            "failed": BaseModule.ModuleStatus.FAILED,
+            "success": BaseModule.ModuleStatus.SUCCESS,
+        }
+        
+        return status_map.get(status_str)
 

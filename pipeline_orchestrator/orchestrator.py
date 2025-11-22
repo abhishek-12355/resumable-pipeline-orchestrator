@@ -127,15 +127,28 @@ class PipelineOrchestrator:
         """
         Execute the pipeline.
         
+        Automatically re-executes failed modules from previous runs.
+        Failed modules are identified from checkpoint metadata and included
+        in execution batches.
+        
         Returns:
             Dictionary mapping module names to results (or errors)
         """
         logger.info(f"Starting pipeline execution: {self.config.name}")
         
+        # Check for failed modules from previous runs
+        failed_modules = self.results_manager.get_failed_modules()
+        if failed_modules:
+            logger.info(
+                f"Found {len(failed_modules)} failed module(s) from previous run(s): {failed_modules}. "
+                f"These will be re-executed."
+            )
+        
         # Load modules
         self.load_modules()
         
         # Get execution order (batches of parallelizable modules)
+        # Failed modules are not marked as completed, so they will be included in batches
         execution_batches = self.dependency_graph.get_execution_order()
         logger.info(f"Pipeline execution plan: {len(execution_batches)} batch(es)")
         
@@ -202,10 +215,20 @@ class PipelineOrchestrator:
                 dependency_results = self.results_manager.get_dependency_results(module_name)
                 
                 # Create nested execution function for context
-                def create_execute_tasks_fn(module_name: str):
-                    def execute_tasks(tasks):
-                        return self._execute_nested_tasks(module_name, tasks)
-                    return execute_tasks
+                # Note: For process workers, we don't set execute_tasks_fn here because
+                # nested functions can't be pickled. The executor will set it in the
+                # worker process using the IPC client.
+                execute_tasks_fn = None
+                if isinstance(self.executor, ParallelExecutor) and self.executor.worker_type == "process":
+                    # Leave as None for process workers - executor will set it via IPC
+                    execute_tasks_fn = None
+                else:
+                    # For sequential or thread workers, we can use nested functions
+                    def create_execute_tasks_fn(module_name: str):
+                        def execute_tasks(tasks):
+                            return self._execute_nested_tasks(module_name, tasks)
+                        return execute_tasks
+                    execute_tasks_fn = create_execute_tasks_fn(module_name)
                 
                 context = ModuleContext(
                     module_name=module_name,
@@ -219,7 +242,7 @@ class PipelineOrchestrator:
                         "gpu_names": gpu_names
                     },
                     dependency_results=dependency_results,
-                    execute_tasks_fn=create_execute_tasks_fn(module_name)
+                    execute_tasks_fn=execute_tasks_fn
                 )
                 
                 batch_modules[module_name] = module
@@ -370,6 +393,32 @@ class PipelineOrchestrator:
             Module result or error
         """
         return self._execution_results.get(module_name)
+    
+    def restart(self) -> Dict[str, Any]:
+        """
+        Restart pipeline execution from failed modules.
+        
+        This method explicitly restarts the pipeline to re-execute failed modules.
+        It's functionally equivalent to execute() since execute() automatically
+        re-executes failed modules. This method is provided for clarity and
+        explicit restart semantics.
+        
+        Returns:
+            Dictionary mapping module names to results (or errors)
+        """
+        logger.info(f"Restarting pipeline execution: {self.config.name}")
+        
+        # Check for failed modules
+        failed_modules = self.results_manager.get_failed_modules()
+        if not failed_modules:
+            logger.info("No failed modules found. Pipeline may be complete or fresh.")
+        else:
+            logger.info(
+                f"Restarting with {len(failed_modules)} failed module(s): {failed_modules}"
+            )
+        
+        # Execute pipeline (will automatically include failed modules)
+        return self.execute()
     
     def cleanup(self):
         """Cleanup resources."""

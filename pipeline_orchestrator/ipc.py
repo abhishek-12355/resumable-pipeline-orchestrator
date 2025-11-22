@@ -14,6 +14,9 @@ class WorkerIPCManager:
     
     def __init__(self):
         """Initialize IPC manager."""
+        # Use a Manager to create queues that can be pickled and shared
+        # Manager must be started before creating queues
+        self._manager = multiprocessing.Manager()
         # Per-worker communication channels
         # {worker_id: (request_queue, response_queue)}
         self._channels: Dict[str, Tuple[multiprocessing.Queue, multiprocessing.Queue]] = {}
@@ -22,6 +25,8 @@ class WorkerIPCManager:
     def create_channel(self, worker_id: str) -> Tuple[multiprocessing.Queue, multiprocessing.Queue]:
         """
         Create request/response queue pair for a worker.
+        
+        Uses Manager queues so they can be pickled and shared across processes.
         
         Args:
             worker_id: Unique identifier for the worker
@@ -33,8 +38,9 @@ class WorkerIPCManager:
             if worker_id in self._channels:
                 raise NestedExecutionError(f"Channel already exists for worker '{worker_id}'")
             
-            request_queue = multiprocessing.Queue()
-            response_queue = multiprocessing.Queue()
+            # Use Manager queues which can be pickled and shared
+            request_queue = self._manager.Queue()
+            response_queue = self._manager.Queue()
             
             self._channels[worker_id] = (request_queue, response_queue)
             
@@ -136,6 +142,11 @@ class WorkerIPCManager:
         with self._lock:
             for worker_id in list(self._channels.keys()):
                 self.remove_channel(worker_id)
+        # Shutdown the manager
+        try:
+            self._manager.shutdown()
+        except Exception:
+            pass
 
 
 class NestedTaskRequest:

@@ -98,6 +98,8 @@ class SequentialExecutor(BaseExecutor):
         results_manager: ResultsManager
     ) -> Dict[str, Any]:
         """Execute modules sequentially."""
+        from pipeline_orchestrator.module import BaseModule
+        
         logger.info(f"Sequential executor: Executing {len(modules)} module(s)")
         results = {}
         
@@ -106,15 +108,36 @@ class SequentialExecutor(BaseExecutor):
             logger.info(f"Executing module: {module_name}")
             
             try:
+                # Set status to PENDING before execution
+                results_manager.save_result(
+                    module_name, None, is_error=False, 
+                    status=BaseModule.ModuleStatus.PENDING
+                )
+                
+                # Set status to IN_PROGRESS when starting execution
+                results_manager.save_result(
+                    module_name, None, is_error=False,
+                    status=BaseModule.ModuleStatus.IN_PROGRESS
+                )
+                
                 result = self.execute_module(module_name, module, context)
                 results[module_name] = result
-                results_manager.save_result(module_name, result, is_error=False)
+                
+                # Set status to SUCCESS on success
+                results_manager.save_result(
+                    module_name, result, is_error=False,
+                    status=BaseModule.ModuleStatus.SUCCESS
+                )
                 logger.info(f"Module {module_name} completed successfully")
             except Exception as e:
                 logger.error(f"Module {module_name} failed: {e}")
                 results[module_name] = e
-                # Checkpoint failed module
-                results_manager.save_result(module_name, e, is_error=True)
+                
+                # Set status to FAILED on error
+                results_manager.save_result(
+                    module_name, e, is_error=True,
+                    status=BaseModule.ModuleStatus.FAILED
+                )
         
         return results
 
@@ -237,10 +260,24 @@ class ParallelExecutor(BaseExecutor):
         results = {}
         futures: Dict[Future, str] = {}
         
+        # Set status to PENDING for all modules before submitting
+        for module_name in modules:
+            results_manager.save_result(
+                module_name, None, is_error=False,
+                status=BaseModule.ModuleStatus.PENDING
+            )
+        
         with ThreadPoolExecutor(max_workers=len(modules)) as executor:
             # Submit all modules
             for module_name, module in modules.items():
                 context = contexts[module_name]
+                
+                # Set status to IN_PROGRESS when starting execution
+                results_manager.save_result(
+                    module_name, None, is_error=False,
+                    status=BaseModule.ModuleStatus.IN_PROGRESS
+                )
+                
                 future = executor.submit(
                     _ModuleWorker.thread_worker,
                     module_name,
@@ -258,8 +295,11 @@ class ParallelExecutor(BaseExecutor):
                     if isinstance(result, Exception):
                         logger.error(f"Module {module_name} failed: {result}")
                         results[module_name] = result
-                        # Checkpoint failed module
-                        results_manager.save_result(module_name, result, is_error=True)
+                        # Set status to FAILED
+                        results_manager.save_result(
+                            module_name, result, is_error=True,
+                            status=BaseModule.ModuleStatus.FAILED
+                        )
                         if self.failure_policy == "fail_fast":
                             logger.warning("Fail-fast policy: Cancelling remaining tasks")
                             # Cancel remaining futures
@@ -270,11 +310,18 @@ class ParallelExecutor(BaseExecutor):
                     else:
                         logger.debug(f"Module {module_name} completed successfully")
                         results[module_name] = result
-                        results_manager.save_result(module_name, result, is_error=False)
+                        # Set status to SUCCESS
+                        results_manager.save_result(
+                            module_name, result, is_error=False,
+                            status=BaseModule.ModuleStatus.SUCCESS
+                        )
                 except Exception as e:
                     results[module_name] = e
-                    # Checkpoint failed module
-                    results_manager.save_result(module_name, e, is_error=True)
+                    # Set status to FAILED
+                    results_manager.save_result(
+                        module_name, e, is_error=True,
+                        status=BaseModule.ModuleStatus.FAILED
+                    )
                     if self.failure_policy == "fail_fast":
                         for f in futures:
                             if not f.done():
@@ -315,12 +362,25 @@ class ParallelExecutor(BaseExecutor):
         )
         nested_handler.start()
         
+        # Set status to PENDING for all modules before submitting
+        for module_name in modules:
+            results_manager.save_result(
+                module_name, None, is_error=False,
+                status=BaseModule.ModuleStatus.PENDING
+            )
+        
         try:
             with ProcessPoolExecutor(max_workers=len(modules)) as executor:
                 # Submit all modules
                 for module_name, module in modules.items():
                     context = contexts[module_name]
                     worker_id, ipc_client = worker_clients[module_name]
+                    
+                    # Set status to IN_PROGRESS when starting execution
+                    results_manager.save_result(
+                        module_name, None, is_error=False,
+                        status=BaseModule.ModuleStatus.IN_PROGRESS
+                    )
                     
                     # Note: Modules and contexts need to be picklable for multiprocessing
                     # This is a limitation - modules must be importable
@@ -343,8 +403,11 @@ class ParallelExecutor(BaseExecutor):
                         if isinstance(result, Exception):
                             logger.error(f"Module {module_name} failed: {result}")
                             results[module_name] = result
-                            # Checkpoint failed module
-                            results_manager.save_result(module_name, result, is_error=True)
+                            # Set status to FAILED
+                            results_manager.save_result(
+                                module_name, result, is_error=True,
+                                status=BaseModule.ModuleStatus.FAILED
+                            )
                             if self.failure_policy == "fail_fast":
                                 logger.warning("Fail-fast policy: Cancelling remaining tasks")
                                 # Cancel remaining futures
@@ -355,12 +418,19 @@ class ParallelExecutor(BaseExecutor):
                         else:
                             logger.debug(f"Module {module_name} completed successfully")
                             results[module_name] = result
-                            results_manager.save_result(module_name, result, is_error=False)
+                            # Set status to SUCCESS
+                            results_manager.save_result(
+                                module_name, result, is_error=False,
+                                status=BaseModule.ModuleStatus.SUCCESS
+                            )
                     except Exception as e:
                         logger.error(f"Exception while waiting for {module_name}: {e}", exc_info=True)
                         results[module_name] = e
-                        # Checkpoint failed module
-                        results_manager.save_result(module_name, e, is_error=True)
+                        # Set status to FAILED
+                        results_manager.save_result(
+                            module_name, e, is_error=True,
+                            status=BaseModule.ModuleStatus.FAILED
+                        )
                         if self.failure_policy == "fail_fast":
                             logger.warning("Fail-fast policy: Cancelling remaining tasks")
                             for f in futures:

@@ -16,7 +16,19 @@ logger = get_logger(__name__)
 
 class BaseModule(ABC):
     """Base class for pipeline modules."""
-    
+
+    from enum import Enum
+
+    class ModuleStatus(Enum):
+        NOT_STARTED = "not_started"
+        PENDING = "pending"
+        IN_PROGRESS = "in_progress"
+        FAILED = "failed"
+        SUCCESS = "success"
+
+    def __init__(self):
+        self.status = BaseModule.ModuleStatus.NOT_STARTED
+
     @abstractmethod
     def run(self, context: ModuleContext) -> Any:
         """
@@ -32,6 +44,12 @@ class BaseModule(ABC):
             Result object (will be checkpointed automatically)
         """
         pass
+
+    def set_status(self, status: "BaseModule.ModuleStatus"):
+        self.status = status
+
+    def get_status(self) -> "BaseModule.ModuleStatus":
+        return self.status
 
 
 class FunctionModuleAdapter(BaseModule):

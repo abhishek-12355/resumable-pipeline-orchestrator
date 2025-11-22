@@ -6,6 +6,7 @@ from pipeline_orchestrator.exceptions import DependencyError
 from pipeline_orchestrator.checkpoint import PipelineCheckpointManager
 from pipeline_orchestrator.dependency import DependencyGraph
 from pipeline_orchestrator.logging_config import get_logger
+from pipeline_orchestrator.module import BaseModule
 
 logger = get_logger(__name__)
 
@@ -41,23 +42,77 @@ class ResultsManager:
             return
         
         completed_modules = self.checkpoint_manager.list_completed_modules()
-        logger.info(f"Found {len(completed_modules)} completed module(s) in checkpoints")
+        logger.info(f"Found {len(completed_modules)} module(s) with checkpoints")
+        
+        success_count = 0
+        failed_count = 0
+        in_progress_count = 0
         
         for module_name in completed_modules:
-            # Mark as completed in dependency graph
-            if not self.dependency_graph.is_completed(module_name):
-                try:
-                    # Load result from checkpoint
+            if self.dependency_graph.is_completed(module_name):
+                continue
+            
+            try:
+                # Get module status from checkpoint metadata
+                status = self.checkpoint_manager.get_module_status(module_name)
+                
+                # Treat IN_PROGRESS as FAILED on restart (crashed module)
+                if status == BaseModule.ModuleStatus.IN_PROGRESS:
+                    logger.warning(
+                        f"Module {module_name} was IN_PROGRESS on restart, treating as FAILED"
+                    )
+                    status = BaseModule.ModuleStatus.FAILED
+                    in_progress_count += 1
+                
+                # Only mark SUCCESS modules as completed
+                if status == BaseModule.ModuleStatus.SUCCESS:
+                    # Load result from checkpoint for SUCCESS modules
                     result, _ = self.checkpoint_manager.load_result(module_name)
                     self._results[module_name] = result
                     self.dependency_graph.mark_completed(module_name)
-                    logger.debug(f"Loaded checkpoint for module: {module_name}")
-                except Exception as e:
-                    # Skip if checkpoint load fails
-                    logger.warning(f"Failed to load checkpoint for {module_name}: {e}")
-                    pass
+                    success_count += 1
+                    logger.debug(f"Loaded successful checkpoint for module: {module_name}")
+                elif status == BaseModule.ModuleStatus.FAILED:
+                    # Load error data for FAILED modules but don't mark as completed
+                    # This allows them to be re-executed
+                    try:
+                        result, _ = self.checkpoint_manager.load_result(module_name)
+                        # Store failed module result separately (don't put in _results)
+                        # Failed modules should not be accessible via get_result()
+                        failed_count += 1
+                        logger.debug(f"Found failed checkpoint for module: {module_name} (will be re-executed)")
+                    except Exception as e:
+                        logger.warning(f"Failed to load checkpoint for {module_name}: {e}")
+                elif status is None:
+                    # No status in metadata, derive from is_error flag
+                    metadata = self.checkpoint_manager.get_checkpoint_metadata(module_name)
+                    if metadata:
+                        custom_metadata = metadata.get("custom_metadata", {})
+                        is_error = custom_metadata.get("is_error", False)
+                        if not is_error:
+                            # Assume success if no error flag
+                            result, _ = self.checkpoint_manager.load_result(module_name)
+                            self._results[module_name] = result
+                            self.dependency_graph.mark_completed(module_name)
+                            success_count += 1
+                            logger.debug(f"Loaded checkpoint for module: {module_name} (no status, assumed success)")
+            except Exception as e:
+                # Skip if checkpoint load fails
+                logger.warning(f"Failed to load checkpoint for {module_name}: {e}")
+                pass
+        
+        logger.info(
+            f"Loaded checkpoints: {success_count} successful, {failed_count + in_progress_count} failed/in_progress "
+            f"(will be re-executed)"
+        )
     
-    def save_result(self, module_name: str, result: Any, is_error: bool = False):
+    def save_result(
+        self, 
+        module_name: str, 
+        result: Any, 
+        is_error: bool = False,
+        status: Optional[BaseModule.ModuleStatus] = None
+    ):
         """
         Save module result (in-memory and checkpoint).
         
@@ -65,25 +120,39 @@ class ResultsManager:
             module_name: Name of the module
             result: Result object or error to save
             is_error: Whether result is an error/exception
+            status: ModuleStatus enum value (if None, derived from is_error)
         """
-        # Store in memory (even errors)
-        self._results[module_name] = result
+        # Determine status if not provided
+        if status is None:
+            status = BaseModule.ModuleStatus.FAILED if is_error else BaseModule.ModuleStatus.SUCCESS
+        
+        # Store in memory (only for SUCCESS modules)
+        # Failed module errors should not be accessible via get_result()
+        if status == BaseModule.ModuleStatus.SUCCESS:
+            self._results[module_name] = result
+        elif status == BaseModule.ModuleStatus.FAILED:
+            # Don't store failed module errors in _results
+            # This ensures get_result() raises DependencyError for failed modules
+            pass
         
         # Save to checkpoint if enabled (always checkpoint, even failures)
         if self.checkpoint_manager and self.checkpoint_manager.enabled:
             try:
-                checkpoint_path = self.checkpoint_manager.save_result(module_name, result, is_error=is_error)
+                checkpoint_path = self.checkpoint_manager.save_result(
+                    module_name, result, is_error=is_error, status=status
+                )
                 logger.debug(
-                    f"Saved {'error' if is_error else 'result'} checkpoint for {module_name}: {checkpoint_path}"
+                    f"Saved checkpoint for {module_name} (status={status.value}, is_error={is_error}): {checkpoint_path}"
                 )
             except Exception as e:
                 # Log but don't fail if checkpoint save fails
                 logger.warning(f"Failed to save checkpoint for {module_name}: {e}")
                 pass
         
-        # Mark as completed in dependency graph (even if failed)
-        # This allows downstream modules to know the module was attempted
-        self.dependency_graph.mark_completed(module_name)
+        # Only mark SUCCESS modules as completed in dependency graph
+        # FAILED modules are not marked as completed (allows re-execution)
+        if status == BaseModule.ModuleStatus.SUCCESS:
+            self.dependency_graph.mark_completed(module_name)
     
     def get_result(self, module_name: str) -> Any:
         """
@@ -93,30 +162,63 @@ class ResultsManager:
             module_name: Name of the module
             
         Returns:
-            Result object
+            Result object (only for SUCCESS modules)
             
         Raises:
-            DependencyError: If module not found or not completed
+            DependencyError: If module not found, not completed, or failed
         """
-        # First try in-memory
+        # First try in-memory (only contains SUCCESS module results)
         if module_name in self._results:
             return self._results[module_name]
         
         # Try checkpoint if enabled
         if self.checkpoint_manager and self.checkpoint_manager.enabled:
             if self.checkpoint_manager.has_checkpoint(module_name):
-                try:
-                    logger.debug(f"Loading result for {module_name} from checkpoint")
-                    result, _ = self.checkpoint_manager.load_result(module_name)
-                    # Cache in memory for future access
-                    self._results[module_name] = result
-                    logger.debug(f"Loaded result for {module_name} from checkpoint")
-                    return result
-                except Exception as e:
-                    logger.error(f"Failed to load checkpoint for {module_name}: {e}")
+                # Check status before loading
+                status = self.checkpoint_manager.get_module_status(module_name)
+                
+                if status == BaseModule.ModuleStatus.FAILED:
                     raise DependencyError(
-                        f"Failed to load checkpoint for module '{module_name}': {e}"
+                        f"Module '{module_name}' failed. Failed modules cannot provide results."
                     )
+                elif status == BaseModule.ModuleStatus.IN_PROGRESS:
+                    raise DependencyError(
+                        f"Module '{module_name}' is in progress. Module has not completed yet."
+                    )
+                elif status == BaseModule.ModuleStatus.SUCCESS:
+                    try:
+                        logger.debug(f"Loading result for {module_name} from checkpoint")
+                        result, _ = self.checkpoint_manager.load_result(module_name)
+                        # Cache in memory for future access
+                        self._results[module_name] = result
+                        logger.debug(f"Loaded result for {module_name} from checkpoint")
+                        return result
+                    except Exception as e:
+                        logger.error(f"Failed to load checkpoint for {module_name}: {e}")
+                        raise DependencyError(
+                            f"Failed to load checkpoint for module '{module_name}': {e}"
+                        )
+                # If status is None or other, try loading anyway (backward compatibility)
+                elif status is None:
+                    try:
+                        logger.debug(f"Loading result for {module_name} from checkpoint (no status)")
+                        result, _ = self.checkpoint_manager.load_result(module_name)
+                        # Check if it's an error object
+                        if isinstance(result, Exception):
+                            raise DependencyError(
+                                f"Module '{module_name}' failed. Failed modules cannot provide results."
+                            )
+                        # Cache in memory for future access
+                        self._results[module_name] = result
+                        logger.debug(f"Loaded result for {module_name} from checkpoint")
+                        return result
+                    except DependencyError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Failed to load checkpoint for {module_name}: {e}")
+                        raise DependencyError(
+                            f"Failed to load checkpoint for module '{module_name}': {e}"
+                        )
         
         # Check if module exists in dependency graph
         try:
@@ -216,4 +318,42 @@ class ResultsManager:
         """
         if module_name in self._results:
             del self._results[module_name]
+    
+    def get_module_status(self, module_name: str) -> Optional[BaseModule.ModuleStatus]:
+        """
+        Get module status from checkpoint or return NOT_STARTED.
+        
+        Args:
+            module_name: Name of the module
+            
+        Returns:
+            ModuleStatus enum value or None if no checkpoint exists
+        """
+        if self.checkpoint_manager and self.checkpoint_manager.enabled:
+            status = self.checkpoint_manager.get_module_status(module_name)
+            return status
+        return None
+    
+    def get_failed_modules(self) -> list:
+        """
+        Get list of failed module names from checkpoints.
+        
+        Returns:
+            List of module names that have failed checkpoints
+        """
+        if not self.checkpoint_manager or not self.checkpoint_manager.enabled:
+            return []
+        
+        failed_modules = []
+        completed_modules = self.checkpoint_manager.list_completed_modules()
+        
+        for module_name in completed_modules:
+            status = self.checkpoint_manager.get_module_status(module_name)
+            if status == BaseModule.ModuleStatus.FAILED:
+                failed_modules.append(module_name)
+            elif status == BaseModule.ModuleStatus.IN_PROGRESS:
+                # Treat IN_PROGRESS as FAILED on restart
+                failed_modules.append(module_name)
+        
+        return failed_modules
 
