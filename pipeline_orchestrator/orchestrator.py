@@ -112,6 +112,8 @@ class PipelineOrchestrator:
                 self.log_manager,
                 enabled=dashboard_enabled,
             )
+            self.log_manager.register_module("orchestrator")
+            self.dashboard.start()
         
         # Executor
         execution_config = self.config.execution
@@ -164,176 +166,174 @@ class PipelineOrchestrator:
             Dictionary mapping module names to results (or errors)
         """
         logger.info(f"Starting pipeline execution: {self.config.name}")
-        dashboard_started = False
+        from contextlib import nullcontext
+        capture_ctx = self.log_manager.capture_streams("orchestrator") if (self.log_manager and self.enable_live_logs) else nullcontext()
         try:
-            if self.dashboard and self.enable_live_logs:
-                self.dashboard.start()
-                dashboard_started = True
-            
-            # Check for failed modules from previous runs
-            failed_modules = self.results_manager.get_failed_modules()
-            if failed_modules:
-                logger.info(
-                    f"Found {len(failed_modules)} failed module(s) from previous run(s): {failed_modules}. "
-                    f"These will be re-executed."
-                )
-            
-            # Load modules
-            self.load_modules()
-            
-            # Get execution order (batches of parallelizable modules)
-            # Failed modules are not marked as completed, so they will be included in batches
-            execution_batches = self.dependency_graph.get_execution_order()
-            logger.info(f"Pipeline execution plan: {len(execution_batches)} batch(es)")
-            
-            # Execute batches sequentially, modules in batch in parallel
-            all_results = {}
-            
-            for batch_idx, batch in enumerate(execution_batches, 1):
-                logger.info(f"Executing batch {batch_idx}/{len(execution_batches)}: {batch}")
-                # Skip already completed modules
-                batch = [m for m in batch if not self.dependency_graph.is_completed(m)]
-                if not batch:
-                    logger.debug(f"Batch {batch_idx}: All modules already completed, skipping")
-                    continue
+            with capture_ctx:
+                # Check for failed modules from previous runs
+                failed_modules = self.results_manager.get_failed_modules()
+                if failed_modules:
+                    logger.info(
+                        f"Found {len(failed_modules)} failed module(s) from previous run(s): {failed_modules}. "
+                        f"These will be re-executed."
+                    )
                 
-                logger.info(f"Batch {batch_idx}: Executing {len(batch)} module(s)")
+                # Load modules
+                self.load_modules()
                 
-                # Prepare modules and contexts for this batch
-                batch_modules = {}
-                batch_contexts = {}
+                # Get execution order (batches of parallelizable modules)
+                # Failed modules are not marked as completed, so they will be included in batches
+                execution_batches = self.dependency_graph.get_execution_order()
+                logger.info(f"Pipeline execution plan: {len(execution_batches)} batch(es)")
                 
-                for module_name in batch:
-                    # Get module
-                    module = self._modules[module_name]
-                    
-                    # Get module config
-                    module_config = self.config.get_module_config(module_name)
-                    if module_config is None:
-                        raise ConfigurationError(f"Module config not found: {module_name}")
-                    
-                    # Reserve resources
-                    resources = module_config.get("resources", {})
-                    cpus = resources.get("cpus", 1)
-                    gpus = resources.get("gpus", 0)
-                    
-                    try:
-                        assigned_gpus, cuda_visible = self.resource_manager.reserve_resources(
-                            module_name, cpus, gpus
-                        )
-                        logger.debug(
-                            f"Reserved resources for {module_name}: {cpus} CPUs, "
-                            f"{len(assigned_gpus)} GPUs {assigned_gpus if assigned_gpus else ''}"
-                        )
-                    except ResourceError as e:
-                        logger.error(f"Failed to reserve resources for {module_name}: {e}")
-                        if self.config.execution["failure_policy"] == "fail_fast":
-                            raise
-                        # In collect_all mode, mark as error and continue
-                        all_results[module_name] = e
+                # Execute batches sequentially, modules in batch in parallel
+                all_results = {}
+                
+                for batch_idx, batch in enumerate(execution_batches, 1):
+                    logger.info(f"Executing batch {batch_idx}/{len(execution_batches)}: {batch}")
+                    # Skip already completed modules
+                    batch = [m for m in batch if not self.dependency_graph.is_completed(m)]
+                    if not batch:
+                        logger.debug(f"Batch {batch_idx}: All modules already completed, skipping")
                         continue
                     
-                    # Get PyTorch device strings and GPU names for allocated GPUs
-                    pytorch_devices = []
-                    gpu_names = []
-                    for gpu_id in assigned_gpus:
-                        pytorch_device = self.resource_manager.get_pytorch_device(gpu_id)
-                        pytorch_devices.append(pytorch_device)
-                        gpu_name = self.resource_manager.get_gpu_name(gpu_id)
-                        if gpu_name:
-                            gpu_names.append(gpu_name)
-                        else:
-                            gpu_names.append(f"GPU {gpu_id}")
+                    logger.info(f"Batch {batch_idx}: Executing {len(batch)} module(s)")
                     
-                    if self.log_manager:
-                        self.log_manager.register_module(module_name)
+                    # Prepare modules and contexts for this batch
+                    batch_modules = {}
+                    batch_contexts = {}
                     
-                    # Create context
-                    dependency_results = self.results_manager.get_dependency_results(module_name)
-                    
-                    # Create nested execution function for context
-                    # Note: For process workers, we don't set execute_tasks_fn here because
-                    # nested functions can't be pickled. The executor will set it in the
-                    # worker process using the IPC client.
-                    execute_tasks_fn = None
-                    if isinstance(self.executor, ParallelExecutor) and self.executor.worker_type == "process":
-                        # Leave as None for process workers - executor will set it via IPC
+                    for module_name in batch:
+                        # Get module
+                        module = self._modules[module_name]
+                        
+                        # Get module config
+                        module_config = self.config.get_module_config(module_name)
+                        if module_config is None:
+                            raise ConfigurationError(f"Module config not found: {module_name}")
+                        
+                        # Reserve resources
+                        resources = module_config.get("resources", {})
+                        cpus = resources.get("cpus", 1)
+                        gpus = resources.get("gpus", 0)
+                        
+                        try:
+                            assigned_gpus, cuda_visible = self.resource_manager.reserve_resources(
+                                module_name, cpus, gpus
+                            )
+                            logger.debug(
+                                f"Reserved resources for {module_name}: {cpus} CPUs, "
+                                f"{len(assigned_gpus)} GPUs {assigned_gpus if assigned_gpus else ''}"
+                            )
+                        except ResourceError as e:
+                            logger.error(f"Failed to reserve resources for {module_name}: {e}")
+                            if self.config.execution["failure_policy"] == "fail_fast":
+                                raise
+                            # In collect_all mode, mark as error and continue
+                            all_results[module_name] = e
+                            continue
+                        
+                        # Get PyTorch device strings and GPU names for allocated GPUs
+                        pytorch_devices = []
+                        gpu_names = []
+                        for gpu_id in assigned_gpus:
+                            pytorch_device = self.resource_manager.get_pytorch_device(gpu_id)
+                            pytorch_devices.append(pytorch_device)
+                            gpu_name = self.resource_manager.get_gpu_name(gpu_id)
+                            if gpu_name:
+                                gpu_names.append(gpu_name)
+                            else:
+                                gpu_names.append(f"GPU {gpu_id}")
+                        
+                        if self.log_manager:
+                            self.log_manager.register_module(module_name)
+                        
+                        # Create context
+                        dependency_results = self.results_manager.get_dependency_results(module_name)
+                        
+                        # Create nested execution function for context
+                        # Note: For process workers, we don't set execute_tasks_fn here because
+                        # nested functions can't be pickled. The executor will set it in the
+                        # worker process using the IPC client.
                         execute_tasks_fn = None
-                    else:
-                        # For sequential or thread workers, we can use nested functions
-                        def create_execute_tasks_fn(module_name: str):
-                            def execute_tasks(tasks):
-                                return self._execute_nested_tasks(module_name, tasks)
-                            return execute_tasks
-                        execute_tasks_fn = create_execute_tasks_fn(module_name)
+                        if isinstance(self.executor, ParallelExecutor) and self.executor.worker_type == "process":
+                            # Leave as None for process workers - executor will set it via IPC
+                            execute_tasks_fn = None
+                        else:
+                            # For sequential or thread workers, we can use nested functions
+                            def create_execute_tasks_fn(module_name: str):
+                                def execute_tasks(tasks):
+                                    return self._execute_nested_tasks(module_name, tasks)
+                                return execute_tasks
+                            execute_tasks_fn = create_execute_tasks_fn(module_name)
+                        
+                        context = ModuleContext(
+                            module_name=module_name,
+                            pipeline_name=self.config.name,
+                            resources={
+                                "cpus": cpus,
+                                "gpus": gpus,
+                                "gpu_ids": assigned_gpus,
+                                "cuda_visible_devices": cuda_visible,
+                                "pytorch_devices": pytorch_devices,
+                                "gpu_names": gpu_names
+                            },
+                            dependency_results=dependency_results,
+                            execute_tasks_fn=execute_tasks_fn
+                        )
+                        
+                        batch_modules[module_name] = module
+                        batch_contexts[module_name] = context
                     
-                    context = ModuleContext(
-                        module_name=module_name,
-                        pipeline_name=self.config.name,
-                        resources={
-                            "cpus": cpus,
-                            "gpus": gpus,
-                            "gpu_ids": assigned_gpus,
-                            "cuda_visible_devices": cuda_visible,
-                            "pytorch_devices": pytorch_devices,
-                            "gpu_names": gpu_names
-                        },
-                        dependency_results=dependency_results,
-                        execute_tasks_fn=execute_tasks_fn
+                    # Execute batch
+                    logger.info(f"Batch {batch_idx}: Starting execution of {len(batch_modules)} module(s)")
+                    batch_results = self.executor.execute_modules(
+                        batch_modules,
+                        batch_contexts,
+                        self.results_manager
                     )
                     
-                    batch_modules[module_name] = module
-                    batch_contexts[module_name] = context
+                    # Release resources
+                    for module_name in batch:
+                        self.resource_manager.release_resources(module_name)
+                        logger.debug(f"Released resources for {module_name}")
+                    
+                    # Collect results
+                    all_results.update(batch_results)
+                    
+                    # Log batch completion
+                    successful = sum(1 for r in batch_results.values() if not isinstance(r, Exception))
+                    failed = len(batch_results) - successful
+                    logger.info(
+                        f"Batch {batch_idx} completed: {successful} succeeded, {failed} failed"
+                    )
+                    
+                    # Check for failures in fail-fast mode
+                    if self.config.execution["failure_policy"] == "fail_fast":
+                        for module_name, result in batch_results.items():
+                            if isinstance(result, Exception):
+                                logger.error(
+                                    f"Module {module_name} failed in fail-fast mode. "
+                                    f"Stopping pipeline execution."
+                                )
+                                # Stop execution on first failure
+                                return all_results
                 
-                # Execute batch
-                logger.info(f"Batch {batch_idx}: Starting execution of {len(batch_modules)} module(s)")
-                batch_results = self.executor.execute_modules(
-                    batch_modules,
-                    batch_contexts,
-                    self.results_manager
-                )
+                self._execution_results = all_results
                 
-                # Release resources
-                for module_name in batch:
-                    self.resource_manager.release_resources(module_name)
-                    logger.debug(f"Released resources for {module_name}")
-                
-                # Collect results
-                all_results.update(batch_results)
-                
-                # Log batch completion
-                successful = sum(1 for r in batch_results.values() if not isinstance(r, Exception))
-                failed = len(batch_results) - successful
+                # Log final summary
+                total_modules = len(all_results)
+                successful_modules = sum(1 for r in all_results.values() if not isinstance(r, Exception))
+                failed_modules = total_modules - successful_modules
                 logger.info(
-                    f"Batch {batch_idx} completed: {successful} succeeded, {failed} failed"
+                    f"Pipeline execution completed: {successful_modules}/{total_modules} modules succeeded"
                 )
+                if failed_modules > 0:
+                    logger.warning(f"{failed_modules} module(s) failed during execution")
                 
-                # Check for failures in fail-fast mode
-                if self.config.execution["failure_policy"] == "fail_fast":
-                    for module_name, result in batch_results.items():
-                        if isinstance(result, Exception):
-                            logger.error(
-                                f"Module {module_name} failed in fail-fast mode. "
-                                f"Stopping pipeline execution."
-                            )
-                            # Stop execution on first failure
-                            return all_results
-            
-            self._execution_results = all_results
-            
-            # Log final summary
-            total_modules = len(all_results)
-            successful_modules = sum(1 for r in all_results.values() if not isinstance(r, Exception))
-            failed_modules = total_modules - successful_modules
-            logger.info(
-                f"Pipeline execution completed: {successful_modules}/{total_modules} modules succeeded"
-            )
-            if failed_modules > 0:
-                logger.warning(f"{failed_modules} module(s) failed during execution")
-            
-            return all_results
+                return all_results
         finally:
-            if self.dashboard and dashboard_started:
+            if self.dashboard and self.enable_live_logs:
                 self.dashboard.stop()
             if self.log_manager and self.enable_live_logs:
                 self.log_manager.shutdown()
