@@ -352,3 +352,69 @@ def capture_process_logs(module_name: str, log_queue: Optional[multiprocessing.Q
         sys.stdout = original_stdout
         sys.stderr = original_stderr
 
+
+@contextmanager
+def capture_process_logger(
+    module_name: str,
+    log_queue: Optional[multiprocessing.Queue],
+    base_formatter: Optional["logging.Formatter"] = None,
+):
+    """
+    Context manager that forwards Python logging.* from a worker process
+    into the multiprocessing log queue, preserving the logger formatter.
+
+    Unlike capture_process_logs() (stdout/stderr), this captures logging
+    subsystem events such as logger.info(), logger.error(), etc.
+    """
+
+    if log_queue is None:
+        yield
+        return
+
+    import logging
+
+    from pipeline_orchestrator.logging import LogEvent
+
+    class _QueueLoggingHandler(logging.Handler):
+        def __init__(self, module_name: str, queue_obj: multiprocessing.Queue):
+            super().__init__()
+            self.module_name = module_name
+            self.queue = queue_obj
+            self.sequence = 0
+
+        def emit(self, record: logging.LogRecord):
+            # Preserve formatting if possible
+            msg = self.format(record)
+            event = LogEvent(
+                timestamp=record.created,
+                module_name=self.module_name,
+                stream=(record.levelname or "LOG").lower(),
+                message=msg,
+                sequence=self.sequence,
+            )
+            self.sequence += 1
+            try:
+                self.queue.put(event)
+            except Exception:
+                pass
+
+    root_logger = logging.getLogger()
+    handler = _QueueLoggingHandler(module_name, log_queue)
+
+    # Mirror formatter from existing handler if available
+    if base_formatter is None and root_logger.handlers:
+        first = root_logger.handlers[0]
+        if first.formatter is not None:
+            base_formatter = first.formatter
+
+    if base_formatter is not None:
+        handler.setFormatter(base_formatter)
+
+    root_logger.addHandler(handler)
+
+    try:
+        yield
+    finally:
+        root_logger.removeHandler(handler)
+        handler.close()
+

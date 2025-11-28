@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import sys
 import threading
 import time
@@ -12,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, Iterable, Iterator, List, Optional, Tuple
+from contextlib import contextmanager
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,29 @@ class _StreamProxy(io.TextIOBase):
 
     def isatty(self):
         return False
+
+class _LoggerToModuleHandler(logging.Handler):
+    """Logging handler that forwards formatted records to ModuleLogManager."""
+
+    def __init__(self, manager: "ModuleLogManager", module_name: str):
+        super().__init__()
+        self.manager = manager
+        self.module_name = module_name
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+        except Exception:
+            # Fallback to basic message if formatter fails
+            msg = record.getMessage()
+        stream = (record.levelname or "LOG").lower()
+        # Use the record's creation time so ordering vs stdout is consistent
+        self.manager.log_text(
+            self.module_name,
+            msg,
+            stream=stream,
+            timestamp=record.created,
+        )
 
 
 class ModuleLogManager:
@@ -217,6 +242,30 @@ class ModuleLogManager:
             proxy_stderr.flush()
             sys.stdout = orig_stdout
             sys.stderr = orig_stderr
+
+    @contextmanager
+    def capture_logger(self, module_name: str):
+        """Attach a logging.Handler that forwards logger records to this module.
+
+        This preserves the formatter configuration of the first existing
+        handler on the root logger (if any), so log lines in the dashboard
+        match console/file formatting as closely as possible.
+        """
+        root_logger = logging.getLogger()
+        handler = _LoggerToModuleHandler(self, module_name)
+
+        # Try to mirror the formatter of the first existing handler, if present
+        if root_logger.handlers:
+            base_handler = root_logger.handlers[0]
+            if base_handler.formatter is not None:
+                handler.setFormatter(base_handler.formatter)
+
+        root_logger.addHandler(handler)
+        try:
+            yield
+        finally:
+            root_logger.removeHandler(handler)
+            handler.close()
 
     def _create_event(
         self,

@@ -20,6 +20,7 @@ from pipeline_orchestrator.ipc import (
     NestedTaskRequest,
     NestedTaskResponse,
     WorkerIPCManager,
+    capture_process_logger,
     capture_process_logs,
 )
 from pipeline_orchestrator.logging import LogEvent, ModuleLogManager
@@ -102,12 +103,17 @@ class SequentialExecutor(BaseExecutor):
         """Execute a module sequentially."""
         logger.debug(f"Executing module: {module_name}")
         try:
-            capture_ctx = (
+            stream_ctx = (
                 self.log_manager.capture_streams(module_name)
                 if self.log_manager
                 else nullcontext()
             )
-            with capture_ctx:
+            logger_ctx = (
+                self.log_manager.capture_logger(module_name)
+                if self.log_manager
+                else nullcontext()  
+            )
+            with stream_ctx, logger_ctx:
                 result = module.run(context)
             logger.debug(f"Module {module_name} completed successfully")
             return result
@@ -183,12 +189,17 @@ class _ModuleWorker:
         worker_logger = get_logger(__name__)
         worker_logger.debug(f"Thread worker starting: {module_name}")
         try:
-            capture_ctx = (
+            stream_ctx = (
                 log_manager.capture_streams(module_name)
                 if log_manager
                 else nullcontext()
             )
-            with capture_ctx:
+            logger_ctx = (
+                log_manager.capture_logger(module_name)
+                if log_manager
+                else nullcontext()
+            )
+            with stream_ctx, logger_ctx:
                 result = module.run(context)
             worker_logger.debug(f"Thread worker completed: {module_name}")
             return (module_name, result)
@@ -220,7 +231,9 @@ class _ModuleWorker:
             # Update context to use IPC client for nested execution
             if ipc_client:
                 context._execute_tasks_fn = lambda tasks: ipc_client.execute_tasks(tasks)
-            with capture_process_logs(module_name, log_queue):
+            stream_ctx = capture_process_logs(module_name, log_queue)
+            logger_ctx = capture_process_logger(module_name, log_queue)
+            with stream_ctx, logger_ctx:
                 result = module.run(context)
             worker_logger.debug(f"Process worker completed: {module_name}")
             return (module_name, result)

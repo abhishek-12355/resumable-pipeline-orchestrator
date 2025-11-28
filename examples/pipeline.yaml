@@ -22,3 +22,9 @@ pipeline:
       resources:
         cpus: 1
         gpus: 0
+    - name: "hello_world2"
+      path: "examples.modules:HelloWorldModule"
+      depends_on: []
+      resources:
+        cpus: 1
+        gpus: 0

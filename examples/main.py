@@ -10,11 +10,11 @@ def main():
     results = orchestrator.execute()
 
     # Access results
-    for module_name, result in results.items():
-        if isinstance(result, Exception):
-            print(f"Module {module_name} failed: {result}")
-        else:
-            print(f"Module {module_name} succeeded: {result}")
+    # for module_name, result in results.items():
+    #     if isinstance(result, Exception):
+    #         print(f"Module {module_name} failed: {result}")
+    #     else:
+    #         print(f"Module {module_name} succeeded: {result}")
 
 
 if __name__ == "__main__":
