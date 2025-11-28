@@ -1,12 +1,17 @@
 """Inter-process communication utilities for nested task execution."""
 
+import io
 import multiprocessing
 import queue
+import sys
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pipeline_orchestrator.exceptions import NestedExecutionError
+from pipeline_orchestrator.logging import LogEvent
 
 
 class WorkerIPCManager:
@@ -253,4 +258,97 @@ class WorkerIPCClient:
             )
         
         return response.results
+
+
+class LogEventPipe:
+    """Simple wrapper around a multiprocessing queue for log forwarding."""
+
+    def __init__(self):
+        self._queue: multiprocessing.Queue = multiprocessing.Queue()
+
+    def sender(self) -> multiprocessing.Queue:
+        """Queue endpoint for the worker process."""
+        return self._queue
+
+    def receiver(self) -> multiprocessing.Queue:
+        """Queue endpoint for the orchestrator."""
+        return self._queue
+
+    def close(self):
+        """Close the underlying queue."""
+        try:
+            self._queue.close()
+        except Exception:
+            pass
+
+
+class _QueueStreamProxy(io.TextIOBase):
+    """Redirects stdout/stderr writes into a multiprocessing queue."""
+
+    def __init__(
+        self,
+        module_name: str,
+        stream: str,
+        queue_obj: multiprocessing.Queue,
+        counter: Dict[str, int],
+    ):
+        self.module_name = module_name
+        self.stream = stream
+        self.queue = queue_obj
+        self.counter = counter
+        self._buffer = ""
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        self._buffer += data
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._emit(line)
+        return len(data)
+
+    def flush(self):
+        if self._buffer:
+            self._emit(self._buffer)
+            self._buffer = ""
+
+    def isatty(self):
+        return False
+
+    def _emit(self, message: str):
+        seq = self.counter["value"]
+        self.counter["value"] += 1
+        event = LogEvent(
+            timestamp=time.time(),
+            module_name=self.module_name,
+            stream=self.stream,
+            message=message.rstrip("\r"),
+            sequence=seq,
+        )
+        try:
+            self.queue.put(event)
+        except Exception:
+            # Swallow errors to avoid crashing the worker
+            pass
+
+
+@contextmanager
+def capture_process_logs(module_name: str, log_queue: Optional[multiprocessing.Queue]):
+    """Context manager that redirects stdout/stderr to a queue for aggregation."""
+    if log_queue is None:
+        yield
+        return
+    counter = {"value": 0}
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    proxy_stdout = _QueueStreamProxy(module_name, "stdout", log_queue, counter)
+    proxy_stderr = _QueueStreamProxy(module_name, "stderr", log_queue, counter)
+    sys.stdout = proxy_stdout
+    sys.stderr = proxy_stderr
+    try:
+        yield
+    finally:
+        proxy_stdout.flush()
+        proxy_stderr.flush()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
 

@@ -12,6 +12,7 @@ A Python library for YAML-driven pipeline orchestration with support for sequent
 - **Nested Execution**: Modules can request parallel sub-task execution
 - **Failure Policies**: Fail-fast or collect-all error handling
 - **Resumption**: Automatically resume from checkpoints on restart
+- **Live Module Logging**: Rich-powered dashboard with per-module log panes plus persisted log files
 
 ## Installation
 
@@ -144,6 +145,28 @@ pipeline:
         cpus: 1
         gpus: 0
 ```
+
+## Live Module Logging
+
+- Configure logging behavior under the optional `pipeline.logging` section:
+
+```yaml
+pipeline:
+  ...
+  logging:
+    enable_live_logs: true
+    logs_directory: "./logs"
+    max_log_file_bytes: 10485760   # 10MB default
+    log_backup_count: 5
+```
+
+- When `enable_live_logs` is true (default) the orchestrator:
+  - Streams each module's `stdout`, `stderr`, and Python logger output into a dedicated Rich panel, similar to `docker build`.
+  - Persists logs under `logs/<pipeline_name>_<timestamp>/<module_name>.log` with automatic file rotation.
+  - Works for sequential, threaded, and process-based workers; process workers forward logs to the parent via IPC queues.
+- The dashboard is automatically disabled when stdout is not a TTY (CI, redirected output), but logs are still captured to files.
+- To opt out completely, set `enable_live_logs: false` in the YAML.
+- Customize the base directory, maximum file size, and rotation count via the YAML keys shown above.
 
 ### Module Configuration
 

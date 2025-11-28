@@ -17,13 +17,15 @@ class PipelineConfig:
         execution: Dict[str, Any],
         resources: Dict[str, int],
         modules: List[Dict[str, Any]],
-        checkpoint: Optional[Dict[str, Any]] = None
+        checkpoint: Optional[Dict[str, Any]] = None,
+        logging: Optional[Dict[str, Any]] = None
     ):
         self.name = name
         self.execution = execution
         self.resources = resources
         self.modules = modules
         self.checkpoint = checkpoint or {}
+        self.logging = logging or {}
         
         # Validate configuration
         self._validate()
@@ -126,6 +128,25 @@ class PipelineConfig:
             "directory": checkpoint_directory
         }
         
+        # Extract logging config
+        logging_config = pipeline_config.get("logging", {})
+        enable_live_logs = logging_config.get("enable_live_logs", True)
+        logs_directory = logging_config.get("logs_directory", "./logs")
+        max_log_file_bytes = logging_config.get("max_log_file_bytes", 10 * 1024 * 1024)
+        log_backup_count = logging_config.get("log_backup_count", 5)
+        
+        if max_log_file_bytes is not None and max_log_file_bytes <= 0:
+            raise ConfigurationError("max_log_file_bytes must be positive if provided")
+        if log_backup_count is not None and log_backup_count < 0:
+            raise ConfigurationError("log_backup_count must be non-negative")
+        
+        logging_settings = {
+            "enable_live_logs": bool(enable_live_logs),
+            "logs_directory": logs_directory,
+            "max_log_file_bytes": max_log_file_bytes,
+            "log_backup_count": log_backup_count,
+        }
+        
         # Extract modules
         modules = pipeline_config.get("modules", [])
         if not modules:
@@ -163,7 +184,8 @@ class PipelineConfig:
             execution=execution_config,
             resources=resources,
             modules=modules,
-            checkpoint=checkpoint
+            checkpoint=checkpoint,
+            logging=logging_settings
         )
     
     def _validate(self):

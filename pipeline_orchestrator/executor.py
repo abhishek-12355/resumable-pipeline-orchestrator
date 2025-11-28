@@ -1,20 +1,32 @@
 """Execution engines for pipeline orchestrator."""
 
-import os
 import multiprocessing
+import os
+import queue
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
+from contextlib import nullcontext
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 
-from pipeline_orchestrator.exceptions import ModuleExecutionError, ResourceError, NestedExecutionError
-from pipeline_orchestrator.resources import ResourceManager
-from pipeline_orchestrator.ipc import WorkerIPCManager, NestedTaskRequest, NestedTaskResponse
-from pipeline_orchestrator.module import BaseModule
 from pipeline_orchestrator.context import ModuleContext
-from pipeline_orchestrator.results import ResultsManager
+from pipeline_orchestrator.exceptions import (
+    ModuleExecutionError,
+    NestedExecutionError,
+    ResourceError,
+)
+from pipeline_orchestrator.ipc import (
+    NestedTaskRequest,
+    NestedTaskResponse,
+    WorkerIPCManager,
+    capture_process_logs,
+)
+from pipeline_orchestrator.logging import LogEvent, ModuleLogManager
 from pipeline_orchestrator.logging_config import get_logger
+from pipeline_orchestrator.module import BaseModule
+from pipeline_orchestrator.resources import ResourceManager
+from pipeline_orchestrator.results import ResultsManager
 
 logger = get_logger(__name__)
 
@@ -66,14 +78,20 @@ class BaseExecutor(ABC):
 class SequentialExecutor(BaseExecutor):
     """Executor for sequential module execution."""
     
-    def __init__(self, resource_manager: ResourceManager):
+    def __init__(
+        self,
+        resource_manager: ResourceManager,
+        log_manager: Optional[ModuleLogManager] = None
+    ):
         """
         Initialize sequential executor.
         
         Args:
             resource_manager: Resource manager instance
+            log_manager: Optional module log manager
         """
         self.resource_manager = resource_manager
+        self.log_manager = log_manager
     
     def execute_module(
         self,
@@ -84,7 +102,13 @@ class SequentialExecutor(BaseExecutor):
         """Execute a module sequentially."""
         logger.debug(f"Executing module: {module_name}")
         try:
-            result = module.run(context)
+            capture_ctx = (
+                self.log_manager.capture_streams(module_name)
+                if self.log_manager
+                else nullcontext()
+            )
+            with capture_ctx:
+                result = module.run(context)
             logger.debug(f"Module {module_name} completed successfully")
             return result
         except Exception as e:
@@ -106,6 +130,9 @@ class SequentialExecutor(BaseExecutor):
         for module_name, module in modules.items():
             context = contexts[module_name]
             logger.info(f"Executing module: {module_name}")
+            
+            if self.log_manager:
+                self.log_manager.register_module(module_name)
             
             try:
                 # Set status to PENDING before execution
@@ -149,13 +176,20 @@ class _ModuleWorker:
     def thread_worker(
         module_name: str,
         module: BaseModule,
-        context: ModuleContext
+        context: ModuleContext,
+        log_manager: Optional[ModuleLogManager] = None
     ) -> Tuple[str, Any]:
         """Thread worker function."""
         worker_logger = get_logger(__name__)
         worker_logger.debug(f"Thread worker starting: {module_name}")
         try:
-            result = module.run(context)
+            capture_ctx = (
+                log_manager.capture_streams(module_name)
+                if log_manager
+                else nullcontext()
+            )
+            with capture_ctx:
+                result = module.run(context)
             worker_logger.debug(f"Thread worker completed: {module_name}")
             return (module_name, result)
         except Exception as e:
@@ -168,7 +202,8 @@ class _ModuleWorker:
         module: BaseModule,
         context: ModuleContext,
         worker_id: str,
-        ipc_client: Optional[Any]
+        ipc_client: Optional[Any],
+        log_queue: Optional[multiprocessing.Queue] = None
     ) -> Tuple[str, Any]:
         """Process worker function."""
         # Set up logging in worker process
@@ -185,8 +220,8 @@ class _ModuleWorker:
             # Update context to use IPC client for nested execution
             if ipc_client:
                 context._execute_tasks_fn = lambda tasks: ipc_client.execute_tasks(tasks)
-            
-            result = module.run(context)
+            with capture_process_logs(module_name, log_queue):
+                result = module.run(context)
             worker_logger.debug(f"Process worker completed: {module_name}")
             return (module_name, result)
         except Exception as e:
@@ -203,7 +238,8 @@ class ParallelExecutor(BaseExecutor):
         worker_type: str = "process",
         failure_policy: str = "fail_fast",
         max_nested_depth: Optional[int] = None,
-        ipc_manager: Optional[WorkerIPCManager] = None
+        ipc_manager: Optional[WorkerIPCManager] = None,
+        log_manager: Optional[ModuleLogManager] = None
     ):
         """
         Initialize parallel executor.
@@ -214,12 +250,14 @@ class ParallelExecutor(BaseExecutor):
             failure_policy: "fail_fast" or "collect_all"
             max_nested_depth: Maximum depth for nested execution (None for unlimited)
             ipc_manager: IPC manager for nested execution (process mode only)
+            log_manager: Optional live log manager
         """
         self.resource_manager = resource_manager
         self.worker_type = worker_type
         self.failure_policy = failure_policy
         self.max_nested_depth = max_nested_depth
         self.ipc_manager = ipc_manager
+        self.log_manager = log_manager
         
         if worker_type == "process" and ipc_manager is None:
             self.ipc_manager = WorkerIPCManager()
@@ -282,7 +320,8 @@ class ParallelExecutor(BaseExecutor):
                     _ModuleWorker.thread_worker,
                     module_name,
                     module,
-                    context
+                    context,
+                    self.log_manager
                 )
                 futures[future] = module_name
             
@@ -352,6 +391,26 @@ class ParallelExecutor(BaseExecutor):
             ipc_client = WorkerIPCClient(worker_id, request_queue, response_queue)
             worker_clients[module_name] = (worker_id, ipc_client)
             logger.debug(f"Created IPC channel for {module_name}: {worker_id}")
+
+        log_receivers: Dict[str, multiprocessing.Queue] = {}
+        if self.log_manager:
+            from multiprocessing import Manager
+
+            manager = Manager()
+            for module_name in modules:
+                # Use a Manager-backed Queue so it can be safely pickled and
+                # passed to worker processes via ProcessPoolExecutor
+                log_receivers[module_name] = manager.Queue()
+            log_listener_stop = threading.Event()
+            log_listener = threading.Thread(
+                target=self._consume_process_log_events,
+                args=(log_receivers, log_listener_stop),
+                daemon=True,
+            )
+            log_listener.start()
+        else:
+            log_listener = None
+            log_listener_stop = None
         
         # Start nested execution handler in background thread
         logger.debug("Starting nested execution handler thread")
@@ -384,13 +443,16 @@ class ParallelExecutor(BaseExecutor):
                     
                     # Note: Modules and contexts need to be picklable for multiprocessing
                     # This is a limitation - modules must be importable
+                    log_queue = log_receivers.get(module_name) if self.log_manager else None
+                    
                     future = executor.submit(
                         _ModuleWorker.process_worker,
                         module_name,
                         module,
                         context,
                         worker_id,
-                        ipc_client
+                        ipc_client,
+                        log_queue
                     )
                     futures[future] = module_name
                 
@@ -442,8 +504,42 @@ class ParallelExecutor(BaseExecutor):
             logger.debug("Cleaning up IPC channels")
             for module_name, (worker_id, _) in worker_clients.items():
                 self.ipc_manager.remove_channel(worker_id)
-        
+
+            if self.log_manager and log_listener_stop and log_listener:
+                log_listener_stop.set()
+                log_listener.join(timeout=2)
+
         return results
+
+    def _consume_process_log_events(
+        self,
+        log_receivers: Dict[str, multiprocessing.Queue],
+        stop_event: threading.Event,
+    ):
+        """Continuously pull log events from worker processes."""
+        if not self.log_manager:
+            return
+        idle_cycles = 0
+        while not stop_event.is_set() or idle_cycles < 5:
+            processed = False
+            for module_name, receiver in log_receivers.items():
+                while True:
+                    try:
+                        event = receiver.get_nowait()
+                    except queue.Empty:
+                        break
+                    if event is None:
+                        continue
+                    processed = True
+                    if isinstance(event, LogEvent):
+                        self.log_manager.ingest_event(event)
+                    else:
+                        self.log_manager.log_text(module_name, str(event))
+            if processed:
+                idle_cycles = 0
+            else:
+                idle_cycles += 1
+                time.sleep(0.05)
     
     def _handle_nested_execution(self, results_manager: ResultsManager):
         """Handle nested execution requests from worker processes."""
