@@ -171,6 +171,8 @@ class ModuleLogManager:
         """Cleanup module resources."""
         with self._lock:
             file_writer = self._files.pop(module_name, None)
+            self._history.pop(module_name, None)
+            self._seq_counters.pop(module_name, None)
         if file_writer:
             file_writer.close()
 

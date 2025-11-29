@@ -28,3 +28,23 @@ pipeline:
       resources:
         cpus: 1
         gpus: 0
+    - name: "hello_world3"
+      path: "examples.modules:HelloWorldModule"
+      depends_on: ["hello_world"]
+      resources:
+        cpus: 1
+        gpus: 0
+
+    - name: "hello_world4"
+      path: "examples.modules:HelloWorldModule"
+      depends_on: []
+      resources:
+        cpus: 1
+        gpus: 0
+
+    - name: "hello_world5"
+      path: "examples.modules:HelloWorldModule"
+      depends_on: ["hello_world4"]
+      resources:
+        cpus: 1
+        gpus: 0

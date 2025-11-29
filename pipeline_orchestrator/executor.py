@@ -177,6 +177,10 @@ class SequentialExecutor(BaseExecutor):
                     module_name, e, is_error=True,
                     status=BaseModule.ModuleStatus.FAILED
                 )
+
+            finally:
+                if self.log_manager:
+                    self.log_manager.unregister_module(module_name)
         
         return results
 

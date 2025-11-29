@@ -1,7 +1,7 @@
 import logging
 from pipeline_orchestrator import PipelineOrchestrator
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 
 def main():

@@ -307,6 +307,9 @@ class PipelineOrchestrator:
                     self.resource_manager.release_resources(module_name)
                     logger.debug(f"Released resources for {module_name}")
 
+                    if self.log_manager:
+                        self.log_manager.unregister_module(module_name)
+
                 # Collect results
                 all_results.update(batch_results)
 

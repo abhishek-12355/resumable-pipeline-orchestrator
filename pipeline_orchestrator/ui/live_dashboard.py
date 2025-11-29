@@ -139,7 +139,7 @@ class LiveDashboard:
                 lines.append(f"[{event.stream}] ", style="dim")
                 lines.append(f"{event.message}\n", style="white")
 
-            panels.append(Panel(lines or Text(""), title=module_name, border_style="blue"))
+            panels.append(Panel(lines or Text(""), title=module_name, border_style="blue", width=120))
         return Columns(panels, expand=True, equal=True) if panels else Panel("")
 
     def _render_footer(self) -> RenderableType:
