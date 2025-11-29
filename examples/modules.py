@@ -16,6 +16,6 @@ class HelloWorldModule:
 
         for i in range(5):
             logger.info(f"Debug message from hello_world module! {i}")
-            time.sleep(3)
+            time.sleep(2)
         
         return "Hello from hello_world module!"

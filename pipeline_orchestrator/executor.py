@@ -1,5 +1,6 @@
 """Execution engines for pipeline orchestrator."""
 
+import logging
 import multiprocessing
 import os
 import queue
@@ -29,11 +30,16 @@ from pipeline_orchestrator.module import BaseModule
 from pipeline_orchestrator.resources import ResourceManager
 from pipeline_orchestrator.results import ResultsManager
 
-logger = get_logger(__name__)
+# Temporary workaround for logging into orchestrator module
+logger = get_logger('orchestrator')
 
 
 class BaseExecutor(ABC):
     """Base class for execution engines."""
+    
+    def __init__(self) -> None:
+        global logger
+        logger = logging.getLogger(__name__)
     
     @abstractmethod
     def execute_module(
@@ -189,17 +195,17 @@ class _ModuleWorker:
         worker_logger = get_logger(__name__)
         worker_logger.debug(f"Thread worker starting: {module_name}")
         try:
-            stream_ctx = (
-                log_manager.capture_streams(module_name)
-                if log_manager
-                else nullcontext()
-            )
+            # stream_ctx = (
+            #     log_manager.capture_streams(module_name)
+            #     if log_manager
+            #     else nullcontext()
+            # )
             logger_ctx = (
                 log_manager.capture_logger(module_name)
                 if log_manager
                 else nullcontext()
             )
-            with stream_ctx, logger_ctx:
+            with logger_ctx:
                 result = module.run(context)
             worker_logger.debug(f"Thread worker completed: {module_name}")
             return (module_name, result)
@@ -217,20 +223,19 @@ class _ModuleWorker:
         log_queue: Optional[multiprocessing.Queue] = None
     ) -> Tuple[str, Any]:
         """Process worker function."""
-        # Set up logging in worker process
-        worker_logger = get_logger(__name__)
         import logging
         from pipeline_orchestrator.ipc import _QueueLoggingHandler
 
-        # Initialize logging once per worker process
-        if not hasattr(_ModuleWorker.process_worker, "_logging_initialized"):
-            root = logging.getLogger()
+        # Ensure only the queue logging handler is attached in each worker process
+        root = logging.getLogger()
+        if not getattr(root, "_queue_handler_installed", False):
             root.handlers.clear()
             handler = _QueueLoggingHandler()
             handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
             root.addHandler(handler)
             root.setLevel(logging.INFO)
-            _ModuleWorker.process_worker._logging_initialized = True
+            root._queue_handler_installed = True
+        worker_logger = get_logger(__name__)
         worker_logger.debug(f"Process worker starting: {module_name} (worker_id: {worker_id})")
         
         # Set CUDA_VISIBLE_DEVICES if GPUs allocated
@@ -454,22 +459,23 @@ class ParallelExecutor(BaseExecutor):
             )
         
         try:
+            from concurrent.futures import as_completed
             with ProcessPoolExecutor(max_workers=len(modules)) as executor:
                 # Submit all modules
                 for module_name, module in modules.items():
                     context = contexts[module_name]
                     worker_id, ipc_client = worker_clients[module_name]
-                    
+
                     # Set status to IN_PROGRESS when starting execution
                     results_manager.save_result(
                         module_name, None, is_error=False,
                         status=BaseModule.ModuleStatus.IN_PROGRESS
                     )
-                    
+
                     # Note: Modules and contexts need to be picklable for multiprocessing
                     # This is a limitation - modules must be importable
                     log_queue = log_receivers.get(module_name) if self.log_manager else None
-                    
+
                     future = executor.submit(
                         _ModuleWorker.process_worker,
                         module_name,
@@ -480,24 +486,21 @@ class ParallelExecutor(BaseExecutor):
                         log_queue
                     )
                     futures[future] = module_name
-                
-                # Collect results as they complete
-                for future in futures:
+
+                # Collect results as they complete (non-blocking)
+                for future in as_completed(futures):
                     module_name = futures[future]
                     try:
                         _, result = future.result()
-                        
                         if isinstance(result, Exception):
                             logger.error(f"Module {module_name} failed: {result}")
                             results[module_name] = result
-                            # Set status to FAILED
                             results_manager.save_result(
                                 module_name, result, is_error=True,
-                                status=BaseModule.ModuleStatus.FAILED
+                                status=BaseModule.ModuleStatus.FAILED,
                             )
                             if self.failure_policy == "fail_fast":
                                 logger.warning("Fail-fast policy: Cancelling remaining tasks")
-                                # Cancel remaining futures
                                 for f in futures:
                                     if not f.done():
                                         f.cancel()
@@ -505,18 +508,16 @@ class ParallelExecutor(BaseExecutor):
                         else:
                             logger.debug(f"Module {module_name} completed successfully")
                             results[module_name] = result
-                            # Set status to SUCCESS
                             results_manager.save_result(
                                 module_name, result, is_error=False,
-                                status=BaseModule.ModuleStatus.SUCCESS
+                                status=BaseModule.ModuleStatus.SUCCESS,
                             )
                     except Exception as e:
                         logger.error(f"Exception while waiting for {module_name}: {e}", exc_info=True)
                         results[module_name] = e
-                        # Set status to FAILED
                         results_manager.save_result(
                             module_name, e, is_error=True,
-                            status=BaseModule.ModuleStatus.FAILED
+                            status=BaseModule.ModuleStatus.FAILED,
                         )
                         if self.failure_policy == "fail_fast":
                             logger.warning("Fail-fast policy: Cancelling remaining tasks")

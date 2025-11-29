@@ -89,6 +89,7 @@ class _StreamProxy(io.TextIOBase):
         self.module_name = module_name
         self.stream = stream
         self._buffer = ""
+        self._is_proxy = True
 
     def write(self, data: str) -> int:
         if not data:

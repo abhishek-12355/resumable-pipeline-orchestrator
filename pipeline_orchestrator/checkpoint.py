@@ -14,7 +14,7 @@ from pipeline_orchestrator.exceptions import CheckpointError
 from pipeline_orchestrator.logging_config import get_logger
 from pipeline_orchestrator.module import BaseModule
 
-logger = get_logger(__name__)
+logger = get_logger("orchestrator")
 
 
 class PipelineCheckpointManager:
@@ -41,6 +41,7 @@ class PipelineCheckpointManager:
                 
                 # Initialize checkpoint manager
                 self.manager = CheckpointManager(config=config)
+                
                 logger.debug("Checkpoint manager initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize checkpoint manager: {e}")

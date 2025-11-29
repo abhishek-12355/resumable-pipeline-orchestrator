@@ -26,7 +26,7 @@ class LiveDashboard:
         self,
         log_manager: ModuleLogManager,
         refresh_rate: float = 0.2,
-        max_lines_per_module: int = 200,
+        max_lines_per_module: int = 50,
         enabled: bool = True,
     ):
         self.log_manager = log_manager
@@ -83,7 +83,6 @@ class LiveDashboard:
 
                 # Drain remaining events quickly
                 self._drain_queue()
-
                 live.update(self._render_layout())
 
     def _drain_queue(self):
@@ -126,8 +125,11 @@ class LiveDashboard:
         panels = []
         for module_name in sorted(self._module_order, key=self._module_order.get):
             events = self._buffers.get(module_name, [])
+
+            # Render only recent lines for performance
+            recent_events = list(events)[-self.max_lines // 2:]  # render half of stored history
             lines = Text()
-            for event in events:
+            for event in recent_events:
                 lines.append(
                     f"{event.formatted_timestamp()} ",
                     style="bold green" if event.stream == "stdout" else "bold red"
@@ -136,6 +138,7 @@ class LiveDashboard:
                 )
                 lines.append(f"[{event.stream}] ", style="dim")
                 lines.append(f"{event.message}\n", style="white")
+
             panels.append(Panel(lines or Text(""), title=module_name, border_style="blue"))
         return Columns(panels, expand=True, equal=True) if panels else Panel("")
 

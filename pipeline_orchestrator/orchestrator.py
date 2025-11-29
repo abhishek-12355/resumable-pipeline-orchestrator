@@ -1,5 +1,6 @@
 """Main pipeline orchestrator."""
 
+import glob
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,7 @@ class PipelineOrchestrator:
             config_path: Path to YAML configuration file
             config: PipelineConfig instance (if not using config_path)
         """
+        global logger
         # Load configuration
         if config is None:
             if config_path is None:
@@ -77,12 +79,12 @@ class PipelineOrchestrator:
             time.sleep(0.05)
             self.log_manager.register_module("orchestrator")
             # Begin orchestrator log capture early
-            self._orchestrator_stream_ctx = self.log_manager.capture_streams("orchestrator")
+            # self._orchestrator_stream_ctx = self.log_manager.capture_streams("orchestrator")
             self._orchestrator_logger_ctx = self.log_manager.capture_logger("orchestrator")
-            self._orchestrator_stream_ctx.__enter__()
+            # self._orchestrator_stream_ctx.__enter__()
             self._orchestrator_logger_ctx.__enter__()
         
-        logger = get_logger("pipeline_orchestrator", force_setup=True)
+        logger = get_logger("orchestrator", force_setup=True)
         logger.info(f"Initializing pipeline orchestrator: {self.config.name}")
         
         # Initialize components
@@ -344,8 +346,8 @@ class PipelineOrchestrator:
                 # Close early-entered orchestrator capture contexts
                 if hasattr(self, "_orchestrator_logger_ctx"):
                     self._orchestrator_logger_ctx.__exit__(None, None, None)
-                if hasattr(self, "_orchestrator_stream_ctx"):
-                    self._orchestrator_stream_ctx.__exit__(None, None, None)
+                # if hasattr(self, "_orchestrator_stream_ctx"):
+                    # self._orchestrator_stream_ctx.__exit__(None, None, None)
             if self.dashboard and self.enable_live_logs:
                 # Restore original console logging handlers
                 if hasattr(self, "_original_handlers"):
