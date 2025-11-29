@@ -3,6 +3,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional
 
 from pipeline_orchestrator.checkpoint import PipelineCheckpointManager
@@ -45,12 +46,43 @@ class PipelineOrchestrator:
         if config is None:
             if config_path is None:
                 raise ConfigurationError("Either config_path or config must be provided")
-            logger.info(f"Loading pipeline configuration from: {config_path}")
+            # logger.info(f"Loading pipeline configuration from: {config_path}")
             self.config = PipelineConfig.from_yaml_file(config_path)
         else:
-            logger.info("Using provided pipeline configuration")
+            # logger.info("Using provided pipeline configuration")
             self.config = config
+
+
+        logging_cfg = self.config.logging or {}
+        self.enable_live_logs = logging_cfg.get("enable_live_logs", True)
+        self.logs_directory = Path(logging_cfg.get("logs_directory", "./logs"))
+        self._log_run_path = None
+        self.log_manager: Optional[ModuleLogManager] = None
+        self.dashboard: Optional[LiveDashboard] = None
+        if self.enable_live_logs:
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            run_path = (self.logs_directory / f"{self.config.name}_{timestamp}").resolve()
+            self._log_run_path = run_path
+            self.log_manager = ModuleLogManager(
+                run_directory=run_path,
+                max_log_bytes=logging_cfg.get("max_log_file_bytes", 10 * 1024 * 1024),
+                backup_count=logging_cfg.get("log_backup_count", 5),
+            )
+            dashboard_enabled = sys.stdout.isatty()
+            self.dashboard = LiveDashboard(
+                self.log_manager,
+                enabled=dashboard_enabled,
+            )
+            self.dashboard.start()
+            time.sleep(0.05)
+            self.log_manager.register_module("orchestrator")
+            # Begin orchestrator log capture early
+            self._orchestrator_stream_ctx = self.log_manager.capture_streams("orchestrator")
+            self._orchestrator_logger_ctx = self.log_manager.capture_logger("orchestrator")
+            self._orchestrator_stream_ctx.__enter__()
+            self._orchestrator_logger_ctx.__enter__()
         
+        logger = get_logger("pipeline_orchestrator", force_setup=True)
         logger.info(f"Initializing pipeline orchestrator: {self.config.name}")
         
         # Initialize components
@@ -91,40 +123,6 @@ class PipelineOrchestrator:
         
         # IPC manager (for nested execution in process mode)
         self.ipc_manager = WorkerIPCManager() if self.config.execution["worker_type"] == "process" else None
-        
-        logging_cfg = self.config.logging or {}
-        self.enable_live_logs = logging_cfg.get("enable_live_logs", True)
-        self.logs_directory = Path(logging_cfg.get("logs_directory", "./logs"))
-        self._log_run_path = None
-        self.log_manager: Optional[ModuleLogManager] = None
-        self.dashboard: Optional[LiveDashboard] = None
-        if self.enable_live_logs:
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            run_path = (self.logs_directory / f"{self.config.name}_{timestamp}").resolve()
-            self._log_run_path = run_path
-            self.log_manager = ModuleLogManager(
-                run_directory=run_path,
-                max_log_bytes=logging_cfg.get("max_log_file_bytes", 10 * 1024 * 1024),
-                backup_count=logging_cfg.get("log_backup_count", 5),
-            )
-            dashboard_enabled = sys.stdout.isatty()
-            self.dashboard = LiveDashboard(
-                self.log_manager,
-                enabled=dashboard_enabled,
-            )
-            self.log_manager.register_module("orchestrator")
-            # Disable existing console logging handlers while dashboard is active
-            import logging
-            root = logging.getLogger()
-            self._original_handlers = list(root.handlers)
-            for h in self._original_handlers:
-                root.removeHandler(h)
-            self.dashboard.start()
-            # Begin orchestrator log capture early
-            self._orchestrator_stream_ctx = self.log_manager.capture_streams("orchestrator")
-            self._orchestrator_logger_ctx = self.log_manager.capture_logger("orchestrator")
-            self._orchestrator_stream_ctx.__enter__()
-            self._orchestrator_logger_ctx.__enter__()
 
         
         # Executor

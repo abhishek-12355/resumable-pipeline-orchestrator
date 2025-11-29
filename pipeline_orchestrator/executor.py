@@ -219,6 +219,18 @@ class _ModuleWorker:
         """Process worker function."""
         # Set up logging in worker process
         worker_logger = get_logger(__name__)
+        import logging
+        from pipeline_orchestrator.ipc import _QueueLoggingHandler
+
+        # Initialize logging once per worker process
+        if not hasattr(_ModuleWorker.process_worker, "_logging_initialized"):
+            root = logging.getLogger()
+            root.handlers.clear()
+            handler = _QueueLoggingHandler()
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            root.addHandler(handler)
+            root.setLevel(logging.INFO)
+            _ModuleWorker.process_worker._logging_initialized = True
         worker_logger.debug(f"Process worker starting: {module_name} (worker_id: {worker_id})")
         
         # Set CUDA_VISIBLE_DEVICES if GPUs allocated

@@ -61,7 +61,7 @@ def setup_logging(
     return logger
 
 
-def get_logger(name: str) -> logging.Logger:
+def get_logger(name: str, force_setup: bool = False) -> logging.Logger:
     """
     Get a logger for a specific module.
     
@@ -73,7 +73,7 @@ def get_logger(name: str) -> logging.Logger:
     """
     # Ensure the root logger is set up
     root_logger = logging.getLogger("pipeline_orchestrator")
-    if not root_logger.handlers:
+    if not root_logger.handlers or force_setup:
         setup_logging()
     
     return logging.getLogger(name)

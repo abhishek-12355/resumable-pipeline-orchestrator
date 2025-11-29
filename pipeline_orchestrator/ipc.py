@@ -7,11 +7,13 @@ import sys
 import threading
 import time
 import uuid
+import logging
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pipeline_orchestrator.exceptions import NestedExecutionError
 from pipeline_orchestrator.logging import LogEvent
+from pipeline_orchestrator.logging.logging_context import get_logging_context, set_logging_context, reset_logging_context
 
 
 class WorkerIPCManager:
@@ -282,6 +284,34 @@ class LogEventPipe:
             pass
 
 
+class _QueueLoggingHandler(logging.Handler):
+    """Per-worker logging handler that forwards log records into the
+    module-specific queue selected via the global routing context."""
+
+    def __init__(self):
+        super().__init__()
+        self.sequence = 0
+
+    def emit(self, record: logging.LogRecord):
+        module_name, queue_obj = get_logging_context()
+        if not queue_obj:
+            return
+        msg = self.format(record)
+        event = LogEvent(
+            timestamp=record.created,
+            module_name=module_name,
+            stream=(record.levelname or "LOG").lower(),
+            message=msg,
+            sequence=self.sequence,
+        )
+        self.sequence += 1
+        try:
+            queue_obj.put(event)
+        except Exception:
+            # Swallow errors to avoid crashing the worker
+            pass
+
+
 class _QueueStreamProxy(io.TextIOBase):
     """Redirects stdout/stderr writes into a multiprocessing queue."""
 
@@ -371,50 +401,8 @@ def capture_process_logger(
         yield
         return
 
-    import logging
-
-    from pipeline_orchestrator.logging import LogEvent
-
-    class _QueueLoggingHandler(logging.Handler):
-        def __init__(self, module_name: str, queue_obj: multiprocessing.Queue):
-            super().__init__()
-            self.module_name = module_name
-            self.queue = queue_obj
-            self.sequence = 0
-
-        def emit(self, record: logging.LogRecord):
-            # Preserve formatting if possible
-            msg = self.format(record)
-            event = LogEvent(
-                timestamp=record.created,
-                module_name=self.module_name,
-                stream=(record.levelname or "LOG").lower(),
-                message=msg,
-                sequence=self.sequence,
-            )
-            self.sequence += 1
-            try:
-                self.queue.put(event)
-            except Exception:
-                pass
-
-    root_logger = logging.getLogger()
-    handler = _QueueLoggingHandler(module_name, log_queue)
-
-    # Mirror formatter from existing handler if available
-    if base_formatter is None and root_logger.handlers:
-        first = root_logger.handlers[0]
-        if first.formatter is not None:
-            base_formatter = first.formatter
-
-    if base_formatter is not None:
-        handler.setFormatter(base_formatter)
-
-    root_logger.addHandler(handler)
-
+    prev_name, prev_queue = set_logging_context(module_name, log_queue)
     try:
         yield
     finally:
-        root_logger.removeHandler(handler)
-        handler.close()
-
+        reset_logging_context(prev_name, prev_queue)

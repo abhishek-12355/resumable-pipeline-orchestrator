@@ -73,9 +73,18 @@ class LiveDashboard:
             transient=False,
         ) as live:
             while not self._stop_event.is_set():
+                try:
+                    event = self._queue.get(timeout=self.refresh_rate)
+                    if event:
+                        self._module_order.setdefault(event.module_name, event.timestamp)
+                        self._buffers[event.module_name].append(event)
+                except queue.Empty:
+                    pass
+
+                # Drain remaining events quickly
                 self._drain_queue()
+
                 live.update(self._render_layout())
-                time.sleep(self.refresh_rate)
 
     def _drain_queue(self):
         if not self._queue:
@@ -135,4 +144,3 @@ class LiveDashboard:
         footer.add_column()
         footer.add_row("[dim]Logs are persisted per module under the run logs directory.[/dim]")
         return Panel(footer, style="dim")
-
