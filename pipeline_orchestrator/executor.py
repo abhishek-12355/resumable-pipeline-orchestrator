@@ -109,7 +109,7 @@ class SequentialExecutor(BaseExecutor):
         """Execute a module sequentially."""
         logger.debug(f"Executing module: {module_name}")
         try:
-            stream_ctx = (
+            stream_ctx = ( # This is dangerous as it will interfare with log dashboard.
                 self.log_manager.capture_streams(module_name)
                 if self.log_manager
                 else nullcontext()

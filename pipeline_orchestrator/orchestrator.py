@@ -48,10 +48,8 @@ class PipelineOrchestrator:
         if config is None:
             if config_path is None:
                 raise ConfigurationError("Either config_path or config must be provided")
-            # logger.info(f"Loading pipeline configuration from: {config_path}")
             self.config = PipelineConfig.from_yaml_file(config_path)
         else:
-            # logger.info("Using provided pipeline configuration")
             self.config = config
 
 
@@ -79,9 +77,7 @@ class PipelineOrchestrator:
             time.sleep(0.05)
             self.log_manager.register_module("orchestrator")
             # Begin orchestrator log capture early
-            # self._orchestrator_stream_ctx = self.log_manager.capture_streams("orchestrator")
             self._orchestrator_logger_ctx = self.log_manager.capture_logger("orchestrator")
-            # self._orchestrator_stream_ctx.__enter__()
             self._orchestrator_logger_ctx.__enter__()
         
         logger = get_logger("orchestrator", force_setup=True)

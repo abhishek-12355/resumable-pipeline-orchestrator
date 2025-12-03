@@ -14,7 +14,7 @@ class HelloWorldModule:
     def run(self, context: ModuleContext):
         logger.info("Hello from hello_world module!")
 
-        for i in range(10):
+        for i in range(3):
             logger.info(f"Debug message from hello_world module! {i}")
             time.sleep(1)
         
