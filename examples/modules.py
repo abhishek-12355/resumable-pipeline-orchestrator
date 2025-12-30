@@ -12,10 +12,11 @@ class HelloWorldModule:
         pass
 
     def run(self, context: ModuleContext):
-        logger.info("Hello from hello_world module!")
+        module_name = context.module_name
+        logger.info(f"Hello from {module_name} module!")
 
         for i in range(3):
-            logger.info(f"Debug message from hello_world module! {i}")
+            logger.info(f"Debug message from {module_name} module! {i}")
             time.sleep(1)
         
-        return "Hello from hello_world module!"
+        return f"Hello from {module_name} module!"

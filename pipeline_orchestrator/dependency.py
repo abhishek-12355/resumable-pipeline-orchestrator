@@ -259,4 +259,14 @@ class DependencyGraph:
             Timestamp when last dependency completed, or 0.0 if no dependencies or not tracked
         """
         return self._dependency_completion_times.get(module_name, 0.0)
+    
+    def reset_completed_modules(self):
+        """
+        Reset all completed modules and dependency completion times.
+        
+        This clears the completion tracking state, allowing all modules
+        to be re-executed. Useful for force restart scenarios.
+        """
+        self.completed_modules.clear()
+        self._dependency_completion_times.clear()
 

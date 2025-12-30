@@ -319,6 +319,16 @@ class ResultsManager:
         if module_name in self._results:
             del self._results[module_name]
     
+    def clear_all_results(self):
+        """
+        Clear all in-memory results (checkpoints remain intact).
+        
+        This clears the in-memory cache of results, but does not delete
+        checkpoints. Useful for force restart scenarios where you want to
+        re-execute all modules but keep checkpoint history.
+        """
+        self._results.clear()
+    
     def get_module_status(self, module_name: str) -> Optional[BaseModule.ModuleStatus]:
         """
         Get module status from checkpoint or return NOT_STARTED.

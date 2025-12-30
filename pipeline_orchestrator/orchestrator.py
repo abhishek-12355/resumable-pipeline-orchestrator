@@ -167,25 +167,37 @@ class PipelineOrchestrator:
                 self._modules[module_name] = module
                 logger.debug(f"Module loaded: {module_name}")
     
-    def execute(self) -> Dict[str, Any]:
+    def execute(self, force_restart: bool = False) -> Dict[str, Any]:
         """
         Execute the pipeline using queue-based execution.
         
         Automatically re-executes failed modules from previous runs.
         All modules are queued and executed through a single execution point (queue worker).
         
+        Args:
+            force_restart: If True, reset all module completion statuses and re-execute
+                         all modules regardless of their current state. If False (default),
+                         only failed modules from previous runs will be re-executed.
+        
         Returns:
             Dictionary mapping module names to results (or errors)
         """
         logger.info(f"Starting pipeline execution: {self.config.name}")
         try:
-            # Check for failed modules from previous runs
-            failed_modules = self.results_manager.get_failed_modules()
-            if failed_modules:
-                logger.info(
-                    f"Found {len(failed_modules)} failed module(s) from previous run(s): {failed_modules}. "
-                    f"These will be re-executed."
-                )
+            # Handle force restart: reset all completion statuses
+            if force_restart:
+                logger.info("Force restart enabled: resetting all module completion statuses")
+                self.dependency_graph.reset_completed_modules()
+                self.results_manager.clear_all_results()
+                logger.info("All modules will be re-executed regardless of checkpoint status")
+            else:
+                # Check for failed modules from previous runs
+                failed_modules = self.results_manager.get_failed_modules()
+                if failed_modules:
+                    logger.info(
+                        f"Found {len(failed_modules)} failed module(s) from previous run(s): {failed_modules}. "
+                        f"These will be re-executed."
+                    )
 
             # Load modules
             self.load_modules()
@@ -463,29 +475,21 @@ class PipelineOrchestrator:
     
     def restart(self) -> Dict[str, Any]:
         """
-        Restart pipeline execution from failed modules.
+        Restart pipeline execution, re-executing all modules.
         
-        This method explicitly restarts the pipeline to re-execute failed modules.
-        It's functionally equivalent to execute() since execute() automatically
-        re-executes failed modules. This method is provided for clarity and
-        explicit restart semantics.
+        This method explicitly restarts the pipeline by resetting all module
+        completion statuses and re-executing all modules regardless of their
+        current state (successful or failed). This is useful when you want to
+        force a full pipeline re-run from scratch.
         
         Returns:
             Dictionary mapping module names to results (or errors)
         """
         logger.info(f"Restarting pipeline execution: {self.config.name}")
+        logger.info("All modules will be re-executed regardless of checkpoint status")
         
-        # Check for failed modules
-        failed_modules = self.results_manager.get_failed_modules()
-        if not failed_modules:
-            logger.info("No failed modules found. Pipeline may be complete or fresh.")
-        else:
-            logger.info(
-                f"Restarting with {len(failed_modules)} failed module(s): {failed_modules}"
-            )
-        
-        # Execute pipeline (will automatically include failed modules)
-        return self.execute()
+        # Execute pipeline with force restart enabled
+        return self.execute(force_restart=True)
     
     def cleanup(self):
         """Cleanup resources."""
