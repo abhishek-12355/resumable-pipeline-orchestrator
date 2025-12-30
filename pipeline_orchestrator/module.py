@@ -6,6 +6,7 @@ import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from enum import Enum, auto
 
 from pipeline_orchestrator.exceptions import ConfigurationError
 from pipeline_orchestrator.context import ModuleContext
@@ -17,7 +18,14 @@ logger = get_logger(__name__)
 class BaseModule(ABC):
     """Base class for pipeline modules."""
 
-    from enum import Enum
+
+    class ModuleState(Enum):
+        NOT_SCHEDULED = auto()
+        QUEUED = auto()
+        RUNNING = auto()
+        COMPLETED = auto()
+        FAILED = auto()
+        
 
     class ModuleStatus(Enum):
         NOT_STARTED = "not_started"

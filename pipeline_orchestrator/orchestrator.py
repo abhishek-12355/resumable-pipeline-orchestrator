@@ -24,6 +24,7 @@ from pipeline_orchestrator.module import BaseModule, ModuleLoader
 from pipeline_orchestrator.resources import ResourceManager
 from pipeline_orchestrator.results import ResultsManager
 from pipeline_orchestrator.ui import LiveDashboard
+from pipeline_orchestrator.queue import ModuleQueue, ExecutionQueueManager
 
 logger = get_logger(__name__)
 
@@ -150,6 +151,10 @@ class PipelineOrchestrator:
         
         # Execution state
         self._execution_results: Dict[str, Any] = {}
+        
+        # Queue system
+        self.module_queue = ModuleQueue()
+        self.queue_manager: Optional[ExecutionQueueManager] = None
     
     def load_modules(self):
         """Load all modules from configuration."""
@@ -164,11 +169,10 @@ class PipelineOrchestrator:
     
     def execute(self) -> Dict[str, Any]:
         """
-        Execute the pipeline.
+        Execute the pipeline using queue-based execution.
         
         Automatically re-executes failed modules from previous runs.
-        Failed modules are identified from checkpoint metadata and included
-        in execution batches.
+        All modules are queued and executed through a single execution point (queue worker).
         
         Returns:
             Dictionary mapping module names to results (or errors)
@@ -186,80 +190,56 @@ class PipelineOrchestrator:
             # Load modules
             self.load_modules()
 
-            # Get execution order (batches of parallelizable modules)
-            # Failed modules are not marked as completed, so they will be included in batches
-            execution_batches = self.dependency_graph.get_execution_order()
-            logger.info(f"Pipeline execution plan: {len(execution_batches)} batch(es)")
+            # Initialize queue manager
+            self.queue_manager = ExecutionQueueManager(
+                queue=self.module_queue,
+                executor=self.executor,
+                resource_manager=self.resource_manager,
+                dependency_graph=self.dependency_graph,
+                results_manager=self.results_manager,
+                modules=self._modules,
+                log_manager=self.log_manager
+            )
+            
+            # Start queue worker thread
+            self.queue_manager.start()
+            logger.info("Queue-based execution started")
 
-            # Execute batches sequentially, modules in batch in parallel
-            all_results = {}
-
-            for batch_idx, batch in enumerate(execution_batches, 1):
-                logger.info(f"Executing batch {batch_idx}/{len(execution_batches)}: {batch}")
-                # Skip already completed modules
-                batch = [m for m in batch if not self.dependency_graph.is_completed(m)]
-                if not batch:
-                    logger.debug(f"Batch {batch_idx}: All modules already completed, skipping")
-                    continue
-
-                logger.info(f"Batch {batch_idx}: Executing {len(batch)} module(s)")
-
-                # Prepare modules and contexts for this batch
-                batch_modules = {}
-                batch_contexts = {}
-
-                for module_name in batch:
-                    # Get module
-                    module = self._modules[module_name]
-
+            # Track which modules have been queued
+            queued_modules: set = set()
+            
+            # Main loop: continuously check for ready modules and enqueue them
+            while True:
+                # Get ready modules ordered by dependency completion time
+                ready_modules = self.dependency_graph.get_ready_modules_with_dependency_order()
+                
+                # Enqueue ready modules that haven't been queued yet
+                for module_name, dependency_completion_time in ready_modules:
+                    if module_name in queued_modules:
+                        continue
+                    
+                    if self.dependency_graph.is_completed(module_name):
+                        continue
+                    
                     # Get module config
                     module_config = self.config.get_module_config(module_name)
                     if module_config is None:
                         raise ConfigurationError(f"Module config not found: {module_name}")
-
-                    # Reserve resources
+                    
+                    # Get resource requirements
                     resources = module_config.get("resources", {})
-                    cpus = resources.get("cpus", 1)
-                    gpus = resources.get("gpus", 0)
-
-                    try:
-                        assigned_gpus, cuda_visible = self.resource_manager.reserve_resources(
-                            module_name, cpus, gpus
-                        )
-                        logger.debug(
-                            f"Reserved resources for {module_name}: {cpus} CPUs, "
-                            f"{len(assigned_gpus)} GPUs {assigned_gpus if assigned_gpus else ''}"
-                        )
-                    except ResourceError as e:
-                        logger.error(f"Failed to reserve resources for {module_name}: {e}")
-                        if self.config.execution["failure_policy"] == "fail_fast":
-                            raise
-                        # In collect_all mode, mark as error and continue
-                        all_results[module_name] = e
-                        continue
-
-                    # Get PyTorch device strings and GPU names for allocated GPUs
-                    pytorch_devices = []
-                    gpu_names = []
-                    for gpu_id in assigned_gpus:
-                        pytorch_device = self.resource_manager.get_pytorch_device(gpu_id)
-                        pytorch_devices.append(pytorch_device)
-                        gpu_name = self.resource_manager.get_gpu_name(gpu_id)
-                        if gpu_name:
-                            gpu_names.append(gpu_name)
-                        else:
-                            gpu_names.append(f"GPU {gpu_id}")
-
-                    if self.log_manager:
-                        self.log_manager.register_module(module_name)
-
-                    # Create context
+                    resource_reqs = {
+                        "cpus": resources.get("cpus", 1),
+                        "gpus": resources.get("gpus", 0)
+                    }
+                    
+                    # Get module
+                    module = self._modules[module_name]
+                    
+                    # Create context (without resource allocation - queue worker will handle it)
                     dependency_results = self.results_manager.get_dependency_results(module_name)
-
+                    
                     # Create nested execution function for context
-                    # Note: For process workers, we don't set execute_tasks_fn here because
-                    # nested functions can't be pickled. The executor will set it in the
-                    # worker process using the IPC client.
                     execute_tasks_fn = None
                     if isinstance(self.executor, ParallelExecutor) and self.executor.worker_type == "process":
                         # Leave as None for process workers - executor will set it via IPC
@@ -271,62 +251,83 @@ class PipelineOrchestrator:
                                 return self._execute_nested_tasks(module_name, tasks)
                             return execute_tasks
                         execute_tasks_fn = create_execute_tasks_fn(module_name)
-
+                    
                     context = ModuleContext(
                         module_name=module_name,
                         pipeline_name=self.config.name,
                         resources={
-                            "cpus": cpus,
-                            "gpus": gpus,
-                            "gpu_ids": assigned_gpus,
-                            "cuda_visible_devices": cuda_visible,
-                            "pytorch_devices": pytorch_devices,
-                            "gpu_names": gpu_names
+                            "cpus": resource_reqs["cpus"],
+                            "gpus": resource_reqs["gpus"],
+                            "gpu_ids": [],
+                            "cuda_visible_devices": None,
+                            "pytorch_devices": [],
+                            "gpu_names": []
                         },
                         dependency_results=dependency_results,
                         execute_tasks_fn=execute_tasks_fn
                     )
-
-                    batch_modules[module_name] = module
-                    batch_contexts[module_name] = context
-
-                # Execute batch
-                logger.info(f"Batch {batch_idx}: Starting execution of {len(batch_modules)} module(s)")
-                batch_results = self.executor.execute_modules(
-                    batch_modules,
-                    batch_contexts,
-                    self.results_manager
-                )
-
-                # Release resources
-                for module_name in batch:
-                    self.resource_manager.release_resources(module_name)
-                    logger.debug(f"Released resources for {module_name}")
-
-                    if self.log_manager:
-                        self.log_manager.unregister_module(module_name)
-
-                # Collect results
-                all_results.update(batch_results)
-
-                # Log batch completion
-                successful = sum(1 for r in batch_results.values() if not isinstance(r, Exception))
-                failed = len(batch_results) - successful
-                logger.info(
-                    f"Batch {batch_idx} completed: {successful} succeeded, {failed} failed"
-                )
-
-                # Check for failures in fail-fast mode
-                if self.config.execution["failure_policy"] == "fail_fast":
-                    for module_name, result in batch_results.items():
-                        if isinstance(result, Exception):
-                            logger.error(
-                                f"Module {module_name} failed in fail-fast mode. "
-                                f"Stopping pipeline execution."
-                            )
-                            # Stop execution on first failure
-                            return all_results
-
+                    
+                    # Enqueue module
+                    self.queue_manager.enqueue_module(
+                        module_name=module_name,
+                        module=module,
+                        context=context,
+                        resource_reqs=resource_reqs,
+                        dependency_completion_time=dependency_completion_time
+                    )
+                    queued_modules.add(module_name)
+                    logger.debug(f"Enqueued module '{module_name}'")
+                
+                # Check if all modules are completed
+                if self.dependency_graph.all_completed():
+                    logger.info("All modules completed")
+                    break
+                
+                # Check if queue is idle (empty and no running modules)
+                if self.queue_manager.is_idle() and len(queued_modules) == len(self._modules):
+                    # All modules have been queued and queue is idle
+                    # Wait a bit to see if any modules are still running
+                    time.sleep(0.1)
+                    if self.queue_manager.is_idle():
+                        logger.info("Queue is idle and all modules have been queued")
+                        break
+                
+                # Small sleep to avoid busy waiting
+                time.sleep(0.05)
+            
+            # Wait for queue to finish processing
+            logger.info("Waiting for queue worker to complete all execution...")
+            max_wait_time = 300  # 5 minutes max wait
+            wait_interval = 0.5
+            waited = 0.0
+            while not self.queue_manager.is_idle() and waited < max_wait_time:
+                time.sleep(wait_interval)
+                waited += wait_interval
+            
+            if not self.queue_manager.is_idle():
+                logger.warning(f"Queue worker did not become idle within {max_wait_time} seconds")
+            
+            # Stop queue manager
+            self.queue_manager.stop(timeout=10.0)
+            
+            # Collect results
+            all_results = self.results_manager.get_all_results()
+            
+            # Also get failed module results
+            for module_name in self._modules:
+                if module_name not in all_results:
+                    # Check if it failed
+                    status = self.results_manager.get_module_status(module_name)
+                    if status == BaseModule.ModuleStatus.FAILED:
+                        # Try to get error from checkpoint
+                        if self.checkpoint_manager:
+                            try:
+                                result, _ = self.checkpoint_manager.load_result(module_name)
+                                if isinstance(result, Exception):
+                                    all_results[module_name] = result
+                            except Exception:
+                                pass
+            
             self._execution_results = all_results
 
             # Log final summary
@@ -338,6 +339,10 @@ class PipelineOrchestrator:
             )
             if failed_modules > 0:
                 logger.warning(f"{failed_modules} module(s) failed during execution")
+                
+                # Check fail-fast policy
+                if self.config.execution["failure_policy"] == "fail_fast":
+                    logger.error("Fail-fast policy: Pipeline execution completed with failures")
 
             return all_results
         finally:
@@ -485,6 +490,15 @@ class PipelineOrchestrator:
     def cleanup(self):
         """Cleanup resources."""
         logger.info("Cleaning up pipeline orchestrator resources")
+        
+        # Stop queue manager if running
+        if self.queue_manager is not None:
+            try:
+                self.queue_manager.stop(timeout=5.0)
+                logger.debug("Queue manager stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping queue manager: {e}")
+        
         if self.ipc_manager:
             self.ipc_manager.cleanup()
             logger.debug("IPC manager cleaned up")

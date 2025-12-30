@@ -1,5 +1,6 @@
 """Dependency graph management for pipeline orchestrator."""
 
+import time
 from typing import Dict, List, Set, Optional
 from collections import defaultdict, deque
 
@@ -33,6 +34,10 @@ class DependencyGraph:
         
         # Track completed modules (for resumption)
         self.completed_modules: Set[str] = set()
+        
+        # Track dependency completion times for queue ordering
+        # Maps module_name -> timestamp when last dependency completed
+        self._dependency_completion_times: Dict[str, float] = {}
     
     def _build_graph(self):
         """Build dependency graph from configuration."""
@@ -172,6 +177,14 @@ class DependencyGraph:
             raise DependencyError(f"Module '{module_name}' not found")
         
         self.completed_modules.add(module_name)
+        
+        # Update dependency completion times for dependents
+        completion_time = time.time()
+        for dependent in self.dependents[module_name]:
+            # Update the dependent's dependency completion time
+            # Use the latest completion time among all dependencies
+            current_time = self._dependency_completion_times.get(dependent, 0.0)
+            self._dependency_completion_times[dependent] = max(current_time, completion_time)
     
     def is_completed(self, module_name: str) -> bool:
         """
@@ -208,4 +221,42 @@ class DependencyGraph:
             raise DependencyError(f"Module '{module_name}' not found")
         
         return self.modules[module_name]
+    
+    def get_ready_modules_with_dependency_order(self) -> List[tuple]:
+        """
+        Get ready modules ordered by dependency completion time.
+        
+        Returns:
+            List of tuples (module_name, dependency_completion_time)
+            Ordered by dependency_completion_time (ascending), then by module name
+        """
+        ready_modules = []
+        
+        for module_name in self.modules:
+            if module_name in self.completed_modules:
+                continue
+            
+            # Check if all dependencies are completed
+            deps = self.dependencies[module_name]
+            if all(dep in self.completed_modules for dep in deps):
+                # Get dependency completion time (when last dependency completed)
+                completion_time = self._dependency_completion_times.get(module_name, 0.0)
+                ready_modules.append((module_name, completion_time))
+        
+        # Sort by dependency_completion_time (ascending), then by module name
+        ready_modules.sort(key=lambda x: (x[1], x[0]))
+        
+        return ready_modules
+    
+    def get_dependency_completion_time(self, module_name: str) -> float:
+        """
+        Get the dependency completion time for a module.
+        
+        Args:
+            module_name: Name of the module
+            
+        Returns:
+            Timestamp when last dependency completed, or 0.0 if no dependencies or not tracked
+        """
+        return self._dependency_completion_times.get(module_name, 0.0)
 

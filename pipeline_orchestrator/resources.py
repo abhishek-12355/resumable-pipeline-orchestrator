@@ -278,6 +278,30 @@ class ResourceManager:
             
             return assigned_gpus, cuda_visible
     
+    def try_reserve_resources(
+        self,
+        module_name: str,
+        cpus: int,
+        gpus: int
+    ) -> Tuple[bool, List[int], Optional[str]]:
+        """
+        Try to reserve resources for a module (non-blocking, doesn't raise).
+        
+        Args:
+            module_name: Name of the module
+            cpus: Number of CPUs required
+            gpus: Number of GPUs required
+            
+        Returns:
+            Tuple of (success: bool, assigned_gpu_ids: List[int], cuda_visible_devices_string: Optional[str])
+            If success is False, gpu_ids will be empty list and cuda_visible will be None
+        """
+        try:
+            assigned_gpus, cuda_visible = self.reserve_resources(module_name, cpus, gpus)
+            return True, assigned_gpus, cuda_visible
+        except ResourceError:
+            return False, [], None
+    
     def release_resources(self, module_name: str):
         """
         Release resources allocated to a module.
